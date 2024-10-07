@@ -31,6 +31,12 @@ type cmdRemote struct {
 	global *cmdGlobal
 }
 
+type remoteColumn struct {
+	Name string
+	Data func(string, config.Remote) string
+}
+
+// Command returns a cobra.Command for use with (*cobra.Command).AddCommand.
 func (c *cmdRemote) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("remote")
@@ -95,6 +101,7 @@ type cmdRemoteAdd struct {
 	flagProject    string
 }
 
+// Command returns a cobra.Command for use with (*cobra.Command).AddCommand.
 func (c *cmdRemoteAdd) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("add", i18n.G("[<remote>] <IP|FQDN|URL|token>"))
@@ -111,7 +118,7 @@ Basic authentication can be used when combined with the "simplestreams" protocol
 	cmd.RunE = c.Run
 	cmd.Flags().BoolVar(&c.flagAcceptCert, "accept-certificate", false, i18n.G("Accept certificate"))
 	cmd.Flags().StringVar(&c.flagToken, "token", "", i18n.G("Remote trust token")+"``")
-	cmd.Flags().StringVar(&c.flagProtocol, "protocol", "", i18n.G("Server protocol (incus or simplestreams)")+"``")
+	cmd.Flags().StringVar(&c.flagProtocol, "protocol", "", i18n.G("Server protocol (incus, oci or simplestreams)")+"``")
 	cmd.Flags().StringVar(&c.flagAuthType, "auth-type", "", i18n.G("Server authentication type (tls or oidc)")+"``")
 	cmd.Flags().BoolVar(&c.flagPublic, "public", false, i18n.G("Public image server"))
 	cmd.Flags().StringVar(&c.flagProject, "project", "", i18n.G("Project to use for the remote")+"``")
@@ -163,7 +170,7 @@ func (c *cmdRemoteAdd) findProject(d incus.InstanceServer, project string) (stri
 	return project, nil
 }
 
-func (c *cmdRemoteAdd) RunToken(server string, token string, rawToken *api.CertificateAddToken) error {
+func (c *cmdRemoteAdd) runToken(server string, token string, rawToken *api.CertificateAddToken) error {
 	conf := c.global.conf
 
 	if !conf.HasClientCertificate() {
@@ -281,6 +288,7 @@ func (c *cmdRemoteAdd) addRemoteFromToken(addr string, server string, token stri
 	return conf.SaveConfig(c.global.confPath)
 }
 
+// Run is used in the RunE field of the cobra.Command returned by Command.
 func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 	conf := c.global.conf
 
@@ -324,7 +332,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 
 	rawToken, err := localtls.CertificateTokenDecode(addr)
 	if err == nil {
-		return c.RunToken(server, addr, rawToken)
+		return c.runToken(server, addr, rawToken)
 	}
 
 	// Complex remote URL parsing
@@ -333,10 +341,10 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 		remoteURL = &url.URL{Host: addr}
 	}
 
-	// Fast track simplestreams
-	if c.flagProtocol == "simplestreams" {
+	// Fast track image servers.
+	if slices.Contains([]string{"oci", "simplestreams"}, c.flagProtocol) {
 		if remoteURL.Scheme != "https" {
-			return fmt.Errorf(i18n.G("Only https URLs are supported for simplestreams"))
+			return fmt.Errorf(i18n.G("Only https URLs are supported for oci and simplestreams"))
 		}
 
 		conf.Remotes[server] = config.Remote{Addr: addr, Public: true, Protocol: c.flagProtocol}
@@ -669,6 +677,7 @@ type cmdRemoteGetDefault struct {
 	remote *cmdRemote
 }
 
+// Command returns a cobra.Command for use with (*cobra.Command).AddCommand.
 func (c *cmdRemoteGetDefault) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("get-default")
@@ -681,6 +690,7 @@ func (c *cmdRemoteGetDefault) Command() *cobra.Command {
 	return cmd
 }
 
+// Run is used in the RunE field of the cobra.Command returned by Command.
 func (c *cmdRemoteGetDefault) Run(cmd *cobra.Command, args []string) error {
 	conf := c.global.conf
 
@@ -701,23 +711,142 @@ type cmdRemoteList struct {
 	global *cmdGlobal
 	remote *cmdRemote
 
-	flagFormat string
+	flagFormat  string
+	flagColumns string
 }
 
+// Command returns a cobra.Command for use with (*cobra.Command).AddCommand.
 func (c *cmdRemoteList) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("list")
 	cmd.Aliases = []string{"ls"}
 	cmd.Short = i18n.G("List the available remotes")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`List the available remotes`))
+		`List the available remotes
+
+Default column layout: nupaPsg
+
+== Columns ==
+The -c option takes a comma separated list of arguments that control
+which instance attributes to output when displaying in table or csv
+format.
+
+Column arguments are either pre-defined shorthand chars (see below),
+or (extended) config keys.
+
+Commas between consecutive shorthand chars are optional.
+
+Pre-defined column shorthand chars:
+  n - Name
+  u - URL
+  p - Protocol
+  a - Auth Type
+  P - Public
+  s - Static
+  g - Global`))
 
 	cmd.RunE = c.Run
 	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml|compact)")+"``")
+	cmd.Flags().StringVarP(&c.flagColumns, "columns", "c", defaultRemoteColumns, i18n.G("Columns")+"``")
 
 	return cmd
 }
 
+const defaultRemoteColumns = "nupaPsg"
+
+func (c *cmdRemoteList) parseColumns() ([]remoteColumn, error) {
+	columnsShorthandMap := map[rune]remoteColumn{
+		'n': {i18n.G("NAME"), c.remoteNameColumnData},
+		'u': {i18n.G("URL"), c.addrColumnData},
+		'p': {i18n.G("PROTOCOL"), c.protocolColumnData},
+		'a': {i18n.G("AUTH TYPE"), c.authTypeColumnData},
+		'P': {i18n.G("PUBLIC"), c.publicColumnData},
+		's': {i18n.G("STATIC"), c.staticColumnData},
+		'g': {i18n.G("GLOBAL"), c.globalColumnData},
+	}
+
+	columnList := strings.Split(c.flagColumns, ",")
+	columns := []remoteColumn{}
+
+	for _, columnEntry := range columnList {
+		if columnEntry == "" {
+			return nil, fmt.Errorf(i18n.G("Empty column entry (redundant, leading or trailing command) in '%s'"), c.flagColumns)
+		}
+
+		for _, columnRune := range columnEntry {
+			column, ok := columnsShorthandMap[columnRune]
+			if !ok {
+				return nil, fmt.Errorf(i18n.G("Unknown column shorthand char '%c' in '%s'"), columnRune, columnEntry)
+			}
+
+			columns = append(columns, column)
+		}
+	}
+
+	return columns, nil
+}
+
+func (c *cmdRemoteList) remoteNameColumnData(name string, rc config.Remote) string {
+	conf := c.global.conf
+
+	strName := name
+	if name == conf.DefaultRemote {
+		strName = fmt.Sprintf("%s (%s)", name, i18n.G("current"))
+	}
+
+	return strName
+}
+
+func (c *cmdRemoteList) addrColumnData(name string, rc config.Remote) string {
+	return rc.Addr
+}
+
+func (c *cmdRemoteList) protocolColumnData(name string, rc config.Remote) string {
+	return rc.Protocol
+}
+
+func (c *cmdRemoteList) authTypeColumnData(name string, rc config.Remote) string {
+	if rc.AuthType == "" {
+		if strings.HasPrefix(rc.Addr, "unix:") {
+			rc.AuthType = "file access"
+		} else if rc.Protocol != "incus" {
+			rc.AuthType = "none"
+		} else {
+			rc.AuthType = api.AuthenticationMethodTLS
+		}
+	}
+
+	return rc.AuthType
+}
+
+func (c *cmdRemoteList) publicColumnData(name string, rc config.Remote) string {
+	strPublic := i18n.G("NO")
+	if rc.Public {
+		strPublic = i18n.G("YES")
+	}
+
+	return strPublic
+}
+
+func (c *cmdRemoteList) staticColumnData(name string, rc config.Remote) string {
+	strStatic := i18n.G("NO")
+	if rc.Static {
+		strStatic = i18n.G("YES")
+	}
+
+	return strStatic
+}
+
+func (c *cmdRemoteList) globalColumnData(name string, rc config.Remote) string {
+	strGlobal := i18n.G("NO")
+	if rc.Global {
+		strGlobal = i18n.G("YES")
+	}
+
+	return strGlobal
+}
+
+// Run is used in the RunE field of the cobra.Command returned by Command.
 func (c *cmdRemoteList) Run(cmd *cobra.Command, args []string) error {
 	conf := c.global.conf
 
@@ -727,56 +856,28 @@ func (c *cmdRemoteList) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	columns, err := c.parseColumns()
+	if err != nil {
+		return err
+	}
+
 	// List the remotes
 	data := [][]string{}
 	for name, rc := range conf.Remotes {
-		strPublic := i18n.G("NO")
-		if rc.Public {
-			strPublic = i18n.G("YES")
+
+		line := []string{}
+		for _, column := range columns {
+			line = append(line, column.Data(name, rc))
 		}
 
-		strStatic := i18n.G("NO")
-		if rc.Static {
-			strStatic = i18n.G("YES")
-		}
-
-		strGlobal := i18n.G("NO")
-		if rc.Global {
-			strGlobal = i18n.G("YES")
-		}
-
-		if rc.Protocol == "" {
-			rc.Protocol = "incus"
-		}
-
-		if rc.AuthType == "" {
-			if strings.HasPrefix(rc.Addr, "unix:") {
-				rc.AuthType = "file access"
-			} else if rc.Protocol != "incus" {
-				rc.AuthType = "none"
-			} else {
-				rc.AuthType = api.AuthenticationMethodTLS
-			}
-		}
-
-		strName := name
-		if name == conf.DefaultRemote {
-			strName = fmt.Sprintf("%s (%s)", name, i18n.G("current"))
-		}
-
-		data = append(data, []string{strName, rc.Addr, rc.Protocol, rc.AuthType, strPublic, strStatic, strGlobal})
+		data = append(data, line)
 	}
 
 	sort.Sort(cli.SortColumnsNaturally(data))
 
-	header := []string{
-		i18n.G("NAME"),
-		i18n.G("URL"),
-		i18n.G("PROTOCOL"),
-		i18n.G("AUTH TYPE"),
-		i18n.G("PUBLIC"),
-		i18n.G("STATIC"),
-		i18n.G("GLOBAL"),
+	header := []string{}
+	for _, column := range columns {
+		header = append(header, column.Name)
 	}
 
 	return cli.RenderTable(c.flagFormat, header, data, conf.Remotes)
@@ -788,6 +889,7 @@ type cmdRemoteRename struct {
 	remote *cmdRemote
 }
 
+// Command returns a cobra.Command for use with (*cobra.Command).AddCommand.
 func (c *cmdRemoteRename) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("rename", i18n.G("<remote> <new-name>"))
@@ -809,6 +911,7 @@ func (c *cmdRemoteRename) Command() *cobra.Command {
 	return cmd
 }
 
+// Run is used in the RunE field of the cobra.Command returned by Command.
 func (c *cmdRemoteRename) Run(cmd *cobra.Command, args []string) error {
 	conf := c.global.conf
 
@@ -867,6 +970,7 @@ type cmdRemoteRemove struct {
 	remote *cmdRemote
 }
 
+// Command returns a cobra.Command for use with (*cobra.Command).AddCommand.
 func (c *cmdRemoteRemove) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("remove", i18n.G("<remote>"))
@@ -888,6 +992,7 @@ func (c *cmdRemoteRemove) Command() *cobra.Command {
 	return cmd
 }
 
+// Run is used in the RunE field of the cobra.Command returned by Command.
 func (c *cmdRemoteRemove) Run(cmd *cobra.Command, args []string) error {
 	conf := c.global.conf
 
@@ -930,6 +1035,7 @@ type cmdRemoteSwitch struct {
 	remote *cmdRemote
 }
 
+// Command returns a cobra.Command for use with (*cobra.Command).AddCommand.
 func (c *cmdRemoteSwitch) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Aliases = []string{"set-default"}
@@ -951,6 +1057,7 @@ func (c *cmdRemoteSwitch) Command() *cobra.Command {
 	return cmd
 }
 
+// Run is used in the RunE field of the cobra.Command returned by Command.
 func (c *cmdRemoteSwitch) Run(cmd *cobra.Command, args []string) error {
 	conf := c.global.conf
 
@@ -977,6 +1084,7 @@ type cmdRemoteSetURL struct {
 	remote *cmdRemote
 }
 
+// Command returns a cobra.Command for use with (*cobra.Command).AddCommand.
 func (c *cmdRemoteSetURL) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("set-url", i18n.G("<remote> <URL>"))
@@ -997,6 +1105,7 @@ func (c *cmdRemoteSetURL) Command() *cobra.Command {
 	return cmd
 }
 
+// Run is used in the RunE field of the cobra.Command returned by Command.
 func (c *cmdRemoteSetURL) Run(cmd *cobra.Command, args []string) error {
 	conf := c.global.conf
 

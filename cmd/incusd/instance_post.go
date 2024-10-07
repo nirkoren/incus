@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/gorilla/mux"
 
@@ -203,7 +204,8 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 
 	// Handle simple instance renaming.
 	if !req.Migration {
-		run := func(*operations.Operation) error {
+		run := func(op *operations.Operation) error {
+			inst.SetOperation(op)
 			return inst.Rename(req.Name, true)
 		}
 
@@ -224,25 +226,27 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Checks for running instances.
-	if inst.IsRunning() && (req.Pool != "" || req.Project != "" || target != "") {
-		// Stateless migrations need the instance stopped.
-		if !req.Live {
-			return response.BadRequest(fmt.Errorf("Instance must be stopped to be moved statelessly"))
-		}
+	if inst.IsRunning() {
+		if req.Pool != "" || req.Project != "" || target != "" {
+			// Stateless migrations need the instance stopped.
+			if !req.Live {
+				return response.BadRequest(fmt.Errorf("Instance must be stopped to be moved statelessly"))
+			}
 
-		// Storage pool changes require a stopped instance.
-		if req.Pool != "" {
-			return response.BadRequest(fmt.Errorf("Instance must be stopped to be moved across storage pools"))
-		}
+			// Storage pool changes require a stopped instance.
+			if req.Pool != "" {
+				return response.BadRequest(fmt.Errorf("Instance must be stopped to be moved across storage pools"))
+			}
 
-		// Project changes require a stopped instance.
-		if req.Project != "" {
-			return response.BadRequest(fmt.Errorf("Instance must be stopped to be moved across projects"))
-		}
+			// Project changes require a stopped instance.
+			if req.Project != "" {
+				return response.BadRequest(fmt.Errorf("Instance must be stopped to be moved across projects"))
+			}
 
-		// Name changes require a stopped instance.
-		if req.Name != "" {
-			return response.BadRequest(fmt.Errorf("Instance must be stopped to change their names"))
+			// Name changes require a stopped instance.
+			if req.Name != "" {
+				return response.BadRequest(fmt.Errorf("Instance must be stopped to change their names"))
+			}
 		}
 	} else {
 		// Clear Live flag if instance isn't running.
@@ -311,9 +315,14 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 			return response.SmartError(err)
 		}
 
-		// If no specific server and a placement scriplet exists, call it with the candidates.
-		if targetMemberInfo == nil && s.GlobalConfig.InstancesPlacementScriptlet() != "" {
-			leaderAddress, err := d.gateway.LeaderAddress()
+		// Run instance placement scriptlet if enabled.
+		if s.GlobalConfig.InstancesPlacementScriptlet() != "" {
+			// If a target was specified, limit the list of candidates to that target.
+			if targetMemberInfo != nil {
+				targetCandidates = []db.NodeInfo{*targetMemberInfo}
+			}
+
+			leaderAddress, err := s.Cluster.LeaderAddress()
 			if err != nil {
 				return response.InternalError(err)
 			}
@@ -331,9 +340,18 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 				Reason:  apiScriptlet.InstancePlacementReasonRelocation,
 			}
 
-			targetMemberInfo, err = scriptlet.InstancePlacementRun(r.Context(), logger.Log, s, &req, targetCandidates, leaderAddress)
-			if err != nil {
-				return response.BadRequest(fmt.Errorf("Failed instance placement scriptlet: %w", err))
+			if targetMemberInfo == nil {
+				// Get a new target.
+				targetMemberInfo, err = scriptlet.InstancePlacementRun(r.Context(), logger.Log, s, &req, targetCandidates, leaderAddress)
+				if err != nil {
+					return response.BadRequest(fmt.Errorf("Failed instance placement scriptlet: %w", err))
+				}
+			} else {
+				// Validate the current target.
+				_, err = scriptlet.InstancePlacementRun(r.Context(), logger.Log, s, &req, targetCandidates, leaderAddress)
+				if err != nil {
+					return response.BadRequest(fmt.Errorf("Failed instance placement scriptlet: %w", err))
+				}
 			}
 		}
 
@@ -361,6 +379,12 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		if targetMemberInfo.IsOffline(s.GlobalConfig.OfflineThreshold()) {
 			return response.BadRequest(fmt.Errorf("Target cluster member is offline"))
 		}
+	}
+
+	// If the user requested a specific server group, make sure we can have it recorded.
+	var targetGroupName string
+	if strings.HasPrefix(target, targetGroupPrefix) {
+		targetGroupName = strings.TrimPrefix(target, targetGroupPrefix)
 	}
 
 	// Check that we're not requested to move to the same location we're currently on.
@@ -395,7 +419,8 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 
 		// Setup the instance move operation.
 		run := func(op *operations.Operation) error {
-			return migrateInstance(context.TODO(), s, inst, req, sourceMemberInfo, targetMemberInfo, op)
+			inst.SetOperation(op)
+			return migrateInstance(context.TODO(), s, inst, req, sourceMemberInfo, targetMemberInfo, targetGroupName, op)
 		}
 
 		resources := map[string][]api.URL{}
@@ -445,7 +470,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 }
 
 // Perform the server-side migration.
-func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance, req api.InstancePost, sourceMemberInfo *db.NodeInfo, targetMemberInfo *db.NodeInfo, op *operations.Operation) error {
+func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance, req api.InstancePost, sourceMemberInfo *db.NodeInfo, targetMemberInfo *db.NodeInfo, targetGroupName string, op *operations.Operation) error {
 	// Load the instance storage pool.
 	sourcePool, err := storagePools.LoadByInstance(s, inst)
 	if err != nil {
@@ -491,6 +516,14 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 		// Perform any remaining instance rename.
 		if req.Name != "" {
 			err = inst.Rename(req.Name, true)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Record the new group name if needed.
+		if targetGroupName != "" {
+			err = inst.VolatileSet(map[string]string{"volatile.cluster.group": targetGroupName})
 			if err != nil {
 				return err
 			}
@@ -577,9 +610,10 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 
 		targetProject := inst.Project().Name
 		if req.Project != "" {
-			target = target.UseProject(req.Project)
 			targetProject = req.Project
 		}
+
+		target = target.UseProject(targetProject)
 
 		// Check if we have a root disk in local config.
 		_, _, err = internalInstance.GetRootDiskDevice(targetInstInfo.Devices)
@@ -602,8 +636,13 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 					return err
 				}
 
+				profileDevices, err := dbCluster.GetDevices(ctx, tx.Tx(), "profile")
+				if err != nil {
+					return err
+				}
+
 				for _, profile := range rawProfiles {
-					apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+					apiProfile, err := profile.ToAPI(ctx, tx.Tx(), profileDevices)
 					if err != nil {
 						return err
 					}
@@ -767,6 +806,8 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 			return err
 		}
 
+		sourceOp.CopyRequestor(op)
+
 		// Start the migration source.
 		err = sourceOp.Start()
 		if err != nil {
@@ -809,14 +850,14 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 		}
 
 		// Wait for the migration to complete.
-		err = destOp.Wait()
-		if err != nil {
-			return fmt.Errorf("Instance move to destination failed: %w", err)
-		}
-
 		err = sourceOp.Wait(context.Background())
 		if err != nil {
 			return fmt.Errorf("Instance move to destination failed on source: %w", err)
+		}
+
+		err = destOp.Wait()
+		if err != nil {
+			return fmt.Errorf("Instance move to destination failed: %w", err)
 		}
 
 		// Update the database post-migration.
@@ -827,12 +868,25 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 				return fmt.Errorf("Failed updating cluster member to %q for instance %q: %w", targetMemberInfo.Name, inst.Name(), err)
 			}
 
-			// Restore the original value of "volatile.apply_template".
 			id, err := dbCluster.GetInstanceID(ctx, tx.Tx(), inst.Project().Name, inst.Name())
 			if err != nil {
 				return fmt.Errorf("Failed to get ID of moved instance: %w", err)
 			}
 
+			// Set the cluster group record if needed.
+			if targetGroupName != "" {
+				err = tx.DeleteInstanceConfigKey(ctx, id, "volatile.cluster.group")
+				if err != nil {
+					return fmt.Errorf("Failed to remove volatile.cluster.group config key: %w", err)
+				}
+
+				err = tx.CreateInstanceConfig(ctx, int(id), map[string]string{"volatile.cluster.group": targetGroupName})
+				if err != nil {
+					return fmt.Errorf("Failed to set volatile.apply_template config key: %w", err)
+				}
+			}
+
+			// Restore the original value of "volatile.apply_template".
 			err = tx.DeleteInstanceConfigKey(ctx, id, "volatile.apply_template")
 			if err != nil {
 				return fmt.Errorf("Failed to remove volatile.apply_template config key: %w", err)

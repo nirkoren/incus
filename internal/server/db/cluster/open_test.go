@@ -3,7 +3,9 @@ package cluster_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -55,8 +57,8 @@ func TestEnsureSchema_ClusterNotUpgradable(t *testing.T) {
 				addNode(t, db, "1", schema, apiExtensions)
 				addNode(t, db, "2", schema, apiExtensions-1)
 			},
-			false, // The schema was not updated
-			"",    // No error is returned
+			true, // The schema was not updated
+			"",   // No error is returned
 		},
 		{
 			`this node's schema is behind`,
@@ -65,7 +67,7 @@ func TestEnsureSchema_ClusterNotUpgradable(t *testing.T) {
 				addNode(t, db, "2", schema+1, apiExtensions)
 			},
 			false,
-			"this node's version is behind, please upgrade",
+			"This cluster member's version is behind, please upgrade",
 		},
 		{
 			`this node's number of API extensions is behind`,
@@ -73,8 +75,8 @@ func TestEnsureSchema_ClusterNotUpgradable(t *testing.T) {
 				addNode(t, db, "1", schema, apiExtensions)
 				addNode(t, db, "2", schema, apiExtensions+1)
 			},
-			false,
-			"this node's version is behind, please upgrade",
+			true,
+			"",
 		},
 		{
 			`inconsistent schema version and API extensions number`,
@@ -83,7 +85,7 @@ func TestEnsureSchema_ClusterNotUpgradable(t *testing.T) {
 				addNode(t, db, "2", schema+1, apiExtensions-1)
 			},
 			false,
-			"Cluster members have inconsistent versions",
+			"This cluster member's version is behind, please upgrade",
 		},
 	}
 
@@ -199,7 +201,7 @@ func newDir(t *testing.T) (string, func()) {
 	cleanup := func() {
 		_, err := os.Stat(dir)
 		if err != nil {
-			assert.True(t, os.IsNotExist(err))
+			assert.True(t, errors.Is(err, fs.ErrNotExist))
 		} else {
 			assert.NoError(t, os.RemoveAll(dir))
 		}

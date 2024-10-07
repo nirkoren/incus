@@ -80,6 +80,11 @@ func internalRecoverScan(ctx context.Context, s *state.State, userPools []api.St
 			return err
 		}
 
+		profileDevices, err := dbCluster.GetDevices(ctx, tx.Tx(), "profile")
+		if err != nil {
+			return err
+		}
+
 		// Convert to map for lookups by project name later.
 		projectProfiles = make(map[string][]*api.Profile)
 		for _, profile := range profiles {
@@ -87,7 +92,7 @@ func internalRecoverScan(ctx context.Context, s *state.State, userPools []api.St
 				projectProfiles[profile.Project] = []*api.Profile{}
 			}
 
-			apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+			apiProfile, err := profile.ToAPI(ctx, tx.Tx(), profileDevices)
 			if err != nil {
 				return err
 			}
@@ -527,7 +532,7 @@ func internalRecoverImportInstance(s *state.State, pool storagePools.Pool, proje
 		return nil, nil, fmt.Errorf("Invalid instance type")
 	}
 
-	inst, instOp, cleanup, err := instance.CreateInternal(s, *dbInst, false, true)
+	inst, instOp, cleanup, err := instance.CreateInternal(s, *dbInst, nil, false, true)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed creating instance record: %w", err)
 	}
@@ -578,7 +583,7 @@ func internalRecoverImportInstanceSnapshot(s *state.State, pool storagePools.Poo
 		Name:         poolVol.Container.Name + internalInstance.SnapshotDelimiter + snap.Name,
 		Profiles:     profiles,
 		Stateful:     snap.Stateful,
-	}, false, true)
+	}, nil, false, true)
 	if err != nil {
 		return nil, fmt.Errorf("Failed creating instance snapshot record %q: %w", snap.Name, err)
 	}

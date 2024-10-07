@@ -2,13 +2,14 @@ package drivers
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -167,34 +168,11 @@ func (d *lvm) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, vol
 			return err
 		}
 
-		// Mark the volume for shared locking during live migration.
-		if vol.volType == VolumeTypeVM || vol.IsCustomBlock() {
-			volDevPath := d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, vol.Name())
-			_, err := subprocess.RunCommand("lvchange", "--activate", "sy", "--ignoreactivationskip", volDevPath)
+		if vol.IsVMBlock() {
+			fsVol := vol.NewVMBlockFilesystemVolume()
+			err := d.CreateVolumeFromMigration(fsVol, conn, volTargetArgs, preFiller, op)
 			if err != nil {
 				return err
-			}
-
-			go func(volDevPath string) {
-				// Attempt to re-lock as host-exclusive as soon as possible.
-				// This will only happen once the migration on the source system is fully over.
-				// Re-try every 10s until success as we can't predict how long a migration may take (from a few seconds to hours).
-				for {
-					_, err := subprocess.RunCommand("lvchange", "--activate", "ey", "--ignoreactivationskip", volDevPath)
-					if err == nil {
-						break
-					}
-
-					time.Sleep(10 * time.Second)
-				}
-			}(volDevPath)
-
-			if vol.IsVMBlock() {
-				fsVol := vol.NewVMBlockFilesystemVolume()
-				err := d.CreateVolumeFromMigration(fsVol, conn, volTargetArgs, preFiller, op)
-				if err != nil {
-					return err
-				}
 			}
 		}
 
@@ -251,7 +229,7 @@ func (d *lvm) DeleteVolume(vol Volume, op *operations.Operation) error {
 		// Remove the volume from the storage device.
 		mountPath := vol.MountPath()
 		err = os.RemoveAll(mountPath)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("Error removing LVM logical volume mount path %q: %w", mountPath, err)
 		}
 
@@ -343,7 +321,18 @@ func (d *lvm) commonVolumeRules() map[string]func(value string) error {
 
 // ValidateVolume validates the supplied volume config.
 func (d *lvm) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
-	err := d.validateVolume(vol, d.commonVolumeRules(), removeUnknownKeys)
+	commonRules := d.commonVolumeRules()
+
+	// Disallow block.* settings for regular custom block volumes. These settings only make sense
+	// when using custom filesystem volumes. Incus will create the filesystem
+	// for these volumes, and use the mount options. When attaching a regular block volume to a VM,
+	// these are not mounted by Incus and therefore don't need these config keys.
+	if vol.IsVMBlock() || vol.volType == VolumeTypeCustom && vol.contentType == ContentTypeBlock {
+		delete(commonRules, "block.filesystem")
+		delete(commonRules, "block.mount_options")
+	}
+
+	err := d.validateVolume(vol, commonRules, removeUnknownKeys)
 	if err != nil {
 		return err
 	}
@@ -455,16 +444,6 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op
 
 	l := d.logger.AddContext(logger.Ctx{"dev": volDevPath, "size": fmt.Sprintf("%db", sizeBytes)})
 
-	// Activate volume if needed.
-	activated, err := d.activateVolume(vol)
-	if err != nil {
-		return err
-	}
-
-	if activated {
-		defer func() { _, _ = d.deactivateVolume(vol) }()
-	}
-
 	inUse := vol.MountInUse()
 
 	// Resize filesystem if needed.
@@ -480,6 +459,18 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op
 				return ErrInUse // We don't allow online shrinking of filesytem volumes.
 			}
 
+			// Activate volume if needed.
+			activated, err := d.activateVolume(vol)
+			if err != nil {
+				return err
+			}
+
+			if !activated {
+				defer func() {
+					_, _ = d.activateVolume(vol)
+				}()
+			}
+
 			// Shrink filesystem first.
 			// Pass allowUnsafeResize to allow disabling of filesystem resize safety checks.
 			// We do this as a separate step rather than passing -r to lvresize in resizeLogicalVolume
@@ -487,6 +478,13 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op
 			// otherwise by passing -f to lvresize (required for other reasons) this would then pass
 			// -f onto resize2fs as well.
 			err = shrinkFileSystem(fsType, volDevPath, vol, sizeBytes, allowUnsafeResize)
+			if err != nil {
+				_, _ = d.deactivateVolume(vol)
+				return err
+			}
+
+			// Deactivate the volume for resizing.
+			_, err = d.deactivateVolume(vol)
 			if err != nil {
 				return err
 			}
@@ -499,10 +497,30 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op
 				return err
 			}
 		} else if sizeBytes > oldSizeBytes {
+			// Get exclusive mode if active.
+			release, err := d.acquireExclusive(vol)
+			if err != nil {
+				return err
+			}
+
+			defer release()
+
 			// Grow block device first.
 			err = d.resizeLogicalVolume(volDevPath, sizeBytes)
 			if err != nil {
 				return err
+			}
+
+			// Activate the volume for resizing.
+			activated, err := d.activateVolume(vol)
+			if err != nil {
+				return err
+			}
+
+			if activated {
+				defer func() {
+					_, _ = d.deactivateVolume(vol)
+				}()
 			}
 
 			// Grow the filesystem to fill block device.
@@ -520,12 +538,17 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op
 			if sizeBytes < oldSizeBytes {
 				return fmt.Errorf("Block volumes cannot be shrunk: %w", ErrCannotBeShrunk)
 			}
-
-			if inUse {
-				return ErrInUse // We don't allow online resizing of block volumes.
-			}
 		}
 
+		// Get exclusive mode.
+		release, err := d.acquireExclusive(vol)
+		if err != nil {
+			return err
+		}
+
+		defer release()
+
+		// Resize the block device.
 		err = d.resizeLogicalVolume(volDevPath, sizeBytes)
 		if err != nil {
 			return err
@@ -534,6 +557,18 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op
 		// Move the VM GPT alt header to end of disk if needed (not needed in unsafe resize mode as it is
 		// expected the caller will do all necessary post resize actions themselves).
 		if vol.IsVMBlock() && !allowUnsafeResize {
+			// Activate the volume for resizing.
+			activated, err := d.activateVolume(vol)
+			if err != nil {
+				return err
+			}
+
+			if activated {
+				defer func() {
+					_, _ = d.deactivateVolume(vol)
+				}()
+			}
+
 			err = d.moveGPTAltHeader(volDevPath)
 			if err != nil {
 				return err
@@ -649,7 +684,7 @@ func (d *lvm) ListVolumes() ([]Volume, error) {
 		return nil, fmt.Errorf("Failed getting volume list: %v: %w", strings.TrimSpace(string(errMsg)), err)
 	}
 
-	volList := make([]Volume, len(vols))
+	volList := make([]Volume, 0, len(vols))
 	for _, v := range vols {
 		volList = append(volList, v)
 	}
@@ -706,7 +741,7 @@ func (d *lvm) MountVolume(vol Volume, op *operations.Operation) error {
 
 			d.logger.Debug("Mounted logical volume", logger.Ctx{"volName": vol.name, "dev": volDevPath, "path": mountPath, "options": mountOptions})
 		}
-	} else if vol.contentType == ContentTypeBlock {
+	} else if vol.contentType == ContentTypeBlock || vol.contentType == ContentTypeISO {
 		// For VMs, mount the filesystem volume.
 		if vol.IsVMBlock() {
 			fsVol := vol.NewVMBlockFilesystemVolume()
@@ -761,8 +796,8 @@ func (d *lvm) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Operat
 		}
 
 		ourUnmount = true
-	} else if vol.contentType == ContentTypeBlock {
-		// For VMs, unmount the filesystem volume.
+	} else if vol.contentType == ContentTypeBlock || vol.contentType == ContentTypeISO {
+		// For VMs and ISOs, unmount the filesystem volume.
 		if vol.IsVMBlock() {
 			fsVol := vol.NewVMBlockFilesystemVolume()
 			ourUnmount, err = d.UnmountVolume(fsVol, false, op)
@@ -869,22 +904,27 @@ func (d *lvm) RenameVolume(vol Volume, newVolName string, op *operations.Operati
 // MigrateVolume sends a volume for migration.
 func (d *lvm) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *migration.VolumeSourceArgs, op *operations.Operation) error {
 	if d.clustered && volSrcArgs.ClusterMove {
-		// Mark the volume for shared locking during live migration.
+		// Ensure the volume allows shared access.
 		if vol.volType == VolumeTypeVM || vol.IsCustomBlock() {
 			// Block volume.
 			volDevPath := d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, vol.Name())
-			_, err := subprocess.RunCommand("lvchange", "--activate", "sy", "--ignoreactivationskip", volDevPath)
-			if err != nil {
-				return err
+			if util.PathExists(volDevPath) {
+				_, err := subprocess.RunCommand("lvchange", "--activate", "sy", "--ignoreactivationskip", volDevPath)
+				if err != nil {
+					return err
+				}
 			}
 
 			// Filesystem volume.
 			if vol.IsVMBlock() {
 				fsVol := vol.NewVMBlockFilesystemVolume()
 				volDevPath := d.lvmDevPath(d.config["lvm.vg_name"], fsVol.volType, fsVol.contentType, fsVol.Name())
-				_, err := subprocess.RunCommand("lvchange", "--activate", "sy", "--ignoreactivationskip", volDevPath)
-				if err != nil {
-					return err
+
+				if util.PathExists(volDevPath) {
+					_, err := subprocess.RunCommand("lvchange", "--activate", "sy", "--ignoreactivationskip", volDevPath)
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -983,7 +1023,7 @@ func (d *lvm) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) err
 	// Remove the snapshot mount path from the storage device.
 	snapPath := snapVol.MountPath()
 	err = os.RemoveAll(snapPath)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("Error removing LVM snapshot mount path %q: %w", snapPath, err)
 	}
 

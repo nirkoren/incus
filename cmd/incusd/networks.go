@@ -28,7 +28,6 @@ import (
 	"github.com/lxc/incus/v6/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v6/internal/server/lifecycle"
 	"github.com/lxc/incus/v6/internal/server/network"
-	"github.com/lxc/incus/v6/internal/server/network/ovs"
 	"github.com/lxc/incus/v6/internal/server/project"
 	"github.com/lxc/incus/v6/internal/server/request"
 	"github.com/lxc/incus/v6/internal/server/resources"
@@ -249,6 +248,11 @@ func networksGet(d *Daemon, r *http.Request) response.Response {
 			}
 
 			if !recursion {
+				// Check if project allows access to network.
+				if !project.NetworkAllowed(reqProject.Config, networkName, true) {
+					continue
+				}
+
 				resultString = append(resultString, fmt.Sprintf("/%s/networks/%s", version.APIVersion, networkName))
 			} else {
 				netInfo, err := doNetworkGet(s, r, s.ServerClustered, projectName, reqProject.Config, networkName)
@@ -328,6 +332,10 @@ func networksPost(d *Daemon, r *http.Request) response.Response {
 	// Quick checks.
 	if req.Name == "" {
 		return response.BadRequest(fmt.Errorf("No name provided"))
+	}
+
+	if req.Name == "none" {
+		return response.BadRequest(fmt.Errorf("Network name 'none' is not valid"))
 	}
 
 	// Check if project allows access to network.
@@ -424,15 +432,36 @@ func networksPost(d *Daemon, r *http.Request) response.Response {
 			}
 		}
 
+		exists := false
 		err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+			_, err := tx.GetNetworkID(ctx, projectName, req.Name)
+			if err == nil {
+				exists = true
+			}
+
 			return tx.CreatePendingNetwork(ctx, targetNode, projectName, req.Name, req.Description, netType.DBType(), req.Config)
 		})
 		if err != nil {
 			if err == db.ErrAlreadyDefined {
-				return response.BadRequest(fmt.Errorf("The network is already defined on member %q", targetNode))
+				return response.Conflict(fmt.Errorf("Network %q is already defined on member %q", req.Name, targetNode))
 			}
 
 			return response.SmartError(err)
+		}
+
+		if !exists {
+			err = s.Authorizer.AddNetwork(r.Context(), projectName, req.Name)
+			if err != nil {
+				logger.Error("Failed to add network to authorizer", logger.Ctx{"name": req.Name, "project": projectName, "error": err})
+			}
+
+			n, err := network.LoadByName(s, projectName, req.Name)
+			if err != nil {
+				return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+			}
+
+			requestor := request.CreateRequestor(r)
+			s.Events.SendLifecycle(projectName, lifecycle.NetworkCreated.Event(n, requestor, nil))
 		}
 
 		return resp
@@ -482,6 +511,20 @@ func networksPost(d *Daemon, r *http.Request) response.Response {
 			if err != nil {
 				return response.SmartError(err)
 			}
+
+			// Create the authorization entry and advertise the network as existing.
+			err = s.Authorizer.AddNetwork(r.Context(), projectName, req.Name)
+			if err != nil {
+				logger.Error("Failed to add network to authorizer", logger.Ctx{"name": req.Name, "project": projectName, "error": err})
+			}
+
+			n, err := network.LoadByName(s, projectName, req.Name)
+			if err != nil {
+				return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+			}
+
+			requestor := request.CreateRequestor(r)
+			s.Events.SendLifecycle(projectName, lifecycle.NetworkCreated.Event(n, requestor, nil))
 		}
 
 		err = networksPostCluster(r.Context(), s, projectName, netInfo, req, clientType, netType)
@@ -489,25 +532,12 @@ func networksPost(d *Daemon, r *http.Request) response.Response {
 			return response.SmartError(err)
 		}
 
-		n, err := network.LoadByName(s, projectName, req.Name)
-		if err != nil {
-			return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
-		}
-
-		err = s.Authorizer.AddNetwork(r.Context(), projectName, req.Name)
-		if err != nil {
-			logger.Error("Failed to add network to authorizer", logger.Ctx{"name": req.Name, "project": projectName, "error": err})
-		}
-
-		requestor := request.CreateRequestor(r)
-		s.Events.SendLifecycle(projectName, lifecycle.NetworkCreated.Event(n, requestor, nil))
-
 		return resp
 	}
 
 	// Non-clustered network creation.
 	if netInfo != nil {
-		return response.BadRequest(fmt.Errorf("The network already exists"))
+		return response.Conflict(fmt.Errorf("Network %q already exists", req.Name))
 	}
 
 	revert := revert.New()
@@ -935,7 +965,7 @@ func doNetworkGet(s *state.State, r *http.Request, allNodes bool, projectName st
 	} else if util.PathExists(fmt.Sprintf("/sys/class/net/%s/bonding", apiNet.Name)) {
 		apiNet.Type = "bond"
 	} else {
-		vswitch, err := ovs.NewVSwitch()
+		vswitch, err := s.OVS()
 		if err != nil {
 			return api.Network{}, fmt.Errorf("Failed to connect to OVS: %w", err)
 		}

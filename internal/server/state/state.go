@@ -19,10 +19,15 @@ import (
 	"github.com/lxc/incus/v6/internal/server/fsmonitor"
 	"github.com/lxc/incus/v6/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v6/internal/server/network/ovn"
+	"github.com/lxc/incus/v6/internal/server/network/ovs"
 	"github.com/lxc/incus/v6/internal/server/node"
 	"github.com/lxc/incus/v6/internal/server/sys"
 	localtls "github.com/lxc/incus/v6/shared/tls"
 )
+
+type clusterGateway interface {
+	LeaderAddress() (string, error)
+}
 
 // State is a gateway to the two main stateful components, the database
 // and the operating system. It's typically used by model entities such as
@@ -36,6 +41,9 @@ type State struct {
 
 	// BGP server
 	BGP *bgp.Server
+
+	// Cluster
+	Cluster clusterGateway
 
 	// DNS server
 	DNS *dns.Server
@@ -83,6 +91,8 @@ type State struct {
 	Authorizer auth.Authorizer
 
 	// OVN.
-	OVNNB *ovn.NB
-	OVNSB *ovn.SB
+	OVN func() (*ovn.NB, *ovn.SB, error)
+
+	// OVS.
+	OVS func() (*ovs.VSwitch, error)
 }

@@ -6,7 +6,9 @@ import (
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"math/big"
 	"math/rand"
 	"net"
@@ -188,17 +190,19 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 
 	// Look for profiles. Next cheapest to do.
 	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Get all profiles
 		profiles, err := cluster.GetProfiles(ctx, tx.Tx())
 		if err != nil {
 			return err
 		}
 
-		for _, profile := range profiles {
-			profileDevices, err := cluster.GetProfileDevices(ctx, tx.Tx(), profile.ID)
-			if err != nil {
-				return err
-			}
+		// Get all the profile devices.
+		profileDevices, err := cluster.GetDevices(ctx, tx.Tx(), "profile")
+		if err != nil {
+			return err
+		}
 
+		for _, profile := range profiles {
 			profileProject, err := cluster.GetProject(ctx, tx.Tx(), profile.Project)
 			if err != nil {
 				return err
@@ -209,7 +213,12 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 				return err
 			}
 
-			inUse, err := usedByProfileDevices(s, profileDevices, apiProfileProject, networkProjectName, networkName, networkType)
+			devices := map[string]cluster.Device{}
+			for _, dev := range profileDevices[profile.ID] {
+				devices[dev.Name] = dev
+			}
+
+			inUse, err := usedByProfileDevices(s, devices, apiProfileProject, networkProjectName, networkName, networkType)
 			if err != nil {
 				return err
 			}
@@ -462,7 +471,7 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 			if (util.IsTrue(d["security.ipv4_filtering"]) && d["ipv4.address"] == "") || (util.IsTrue(d["security.ipv6_filtering"]) && d["ipv6.address"] == "") {
 				deviceStaticFileName := dnsmasq.StaticAllocationFileName(inst.Project().Name, inst.Name(), deviceName)
 				_, curIPv4, curIPv6, err := dnsmasq.DHCPStaticAllocation(d["parent"], deviceStaticFileName)
-				if err != nil && !os.IsNotExist(err) {
+				if err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return err
 				}
 
@@ -654,7 +663,7 @@ func inRoutingTable(subnet *net.IPNet) bool {
 		// Get the mask
 		var mask net.IPMask
 		if filename == "ipv6_route" {
-			size, err := strconv.ParseInt(fmt.Sprintf("0x%s", fields[1]), 0, 64)
+			size, err := strconv.ParseInt(fields[1], 16, 0)
 			if err != nil {
 				continue
 			}
@@ -778,8 +787,14 @@ func GetHostDevice(parent string, vlan string) string {
 		return parent
 	}
 
-	// If no VLANs are configured, use the default pattern
+	// If no VLANs are configured, use the default pattern.
 	defaultVlan := fmt.Sprintf("%s.%s", parent, vlan)
+
+	// Handle long interface names.
+	if len(defaultVlan) > 15 {
+		defaultVlan = fmt.Sprintf("incus-vlan-%s", vlan)
+	}
+
 	if !util.PathExists("/proc/net/vlan/config") {
 		return defaultVlan
 	}
@@ -1426,4 +1441,43 @@ func ProxyParseAddr(data string) (*deviceConfig.ProxyAddress, error) {
 	}
 
 	return newProxyAddr, nil
+}
+
+func validateExternalInterfaces(value string) error {
+	for _, entry := range strings.Split(value, ",") {
+		entry = strings.TrimSpace(entry)
+
+		// Test for extended configuration of external interface.
+		entryParts := strings.Split(entry, "/")
+		if len(entryParts) == 3 {
+			// The first part is the interface name.
+			entry = strings.TrimSpace(entryParts[0])
+		}
+
+		err := validate.IsInterfaceName(entry)
+		if err != nil {
+			return fmt.Errorf("Invalid interface name %q: %w", entry, err)
+		}
+
+		if len(entryParts) == 3 {
+			// Check if the parent interface is valid.
+			parent := strings.TrimSpace(entryParts[1])
+			err := validate.IsInterfaceName(parent)
+			if err != nil {
+				return fmt.Errorf("Invalid interface name %q: %w", parent, err)
+			}
+
+			// Check if the VLAN ID is valid.
+			vlanID, err := strconv.Atoi(entryParts[2])
+			if err != nil {
+				return fmt.Errorf("Invalid VLAN ID %q: %w", entryParts[2], err)
+			}
+
+			if vlanID < 1 || vlanID > 4094 {
+				return fmt.Errorf("Invalid VLAN ID %q", entryParts[2])
+			}
+		}
+	}
+
+	return nil
 }

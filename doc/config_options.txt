@@ -16,6 +16,31 @@ User keys can be used in search.
 ```
 
 <!-- config group cluster-cluster end -->
+<!-- config group cluster_group-common start -->
+```{config:option} instances.vm.cpu.ARCHITECTURE.baseline cluster_group-common
+:shortdesc: "CPU base architecture name"
+:type: "string"
+The CPU base architecture name as can be found through `qemu -cpu ?`.
+
+This can be a generic definition like `qemu64` or `kvm64`, or it can be a specific hardware architecture like `EPYC-v2`.
+It's important to ensure that all servers in the group match that baseline.
+```
+
+```{config:option} instances.vm.cpu.ARCHITECTURE.flags cluster_group-common
+:shortdesc: "CPU flags to add/remove to/from the baseline"
+:type: "string"
+A comma separated list of CPU flags to add on top of CPU baseline or a list of flags to remove from it.
+
+To remove a flag, use `-flag`.
+```
+
+```{config:option} user.* cluster_group-common
+:shortdesc: "Free form user key/value storage"
+:type: "string"
+User keys can be used in search.
+```
+
+<!-- config group cluster_group-common end -->
 <!-- config group devices-disk start -->
 ```{config:option} boot.priority devices-disk
 :required: "no"
@@ -48,19 +73,39 @@ User keys can be used in search.
 ```
 
 ```{config:option} io.bus devices-disk
-:default: "`virtio-scsi`"
+:default: "`virtio-scsi` for block, `auto` for file system"
 :required: "no"
-:shortdesc: "Only for VMs: Override the bus for the device (`nvme`, `virtio-blk`, or `virtio-scsi`)"
+:shortdesc: "Only for VMs: Override the bus for the device"
 :type: "string"
+This controls what bus a disk device should be attached to.
 
+For block devices (disks), this is one of:
+- `nvme`
+- `virtio-blk`
+- `virtio-scsi` (default)
+
+For file systems (shared directories or custom volumes), this is one of:
+- `9p`
+- `auto` (default) (`virtiofs` + `9p`, just `9p` if `virtiofsd` is missing)
+- `virtiofs`
 ```
 
 ```{config:option} io.cache devices-disk
 :default: "`none`"
 :required: "no"
-:shortdesc: "Only for VMs: Override the caching mode for the device (`none`, `writeback` or `unsafe`)"
+:shortdesc: "Only for VMs: Override the caching mode for the device"
 :type: "string"
+This controls what bus a disk device should be attached to.
 
+For block devices (disks), this is one of:
+- `none` (default)
+- `writeback`
+- `unsafe`
+
+For file systems (shared directories or custom volumes), this is one of:
+- `none` (default)
+- `metadata`
+- `unsafe`
 ```
 
 ```{config:option} limits.max devices-disk
@@ -357,6 +402,13 @@ User keys can be used in search.
 
 <!-- config group image-requirements end -->
 <!-- config group instance-boot start -->
+```{config:option} boot.autorestart instance-boot
+:liveupdate: "no"
+:shortdesc: "Whether to automatically restart an instance on unexpected exit"
+:type: "bool"
+If set to `true` will attempt up to 10 restarts over a 1 minute period upon unexpected instance exit.
+```
+
 ```{config:option} boot.autostart instance-boot
 :liveupdate: "no"
 :shortdesc: "Whether to always start the instance when the daemon starts"
@@ -384,8 +436,10 @@ The instance with the highest value is started first.
 :defaultdesc: "stop"
 :liveupdate: "yes"
 :shortdesc: "What action to take on the instance when the host is shut down"
-:type: "integer"
+:type: "string"
 Action to take on host shut down
+
+Valid values are: `stop`, `force-stop` or `stateful-stop`
 ```
 
 ```{config:option} boot.host_shutdown_timeout instance-boot
@@ -636,6 +690,38 @@ For example: `both 1000 1000`
 See {ref}`instance-options-qemu` for more information.
 ```
 
+```{config:option} raw.qemu.qmp.early instance-raw
+:condition: "virtual machine"
+:liveupdate: "no"
+:shortdesc: "QMP commands to run before Incus QEMU initialization"
+:type: "blob"
+
+```
+
+```{config:option} raw.qemu.qmp.post-start instance-raw
+:condition: "virtual machine"
+:liveupdate: "no"
+:shortdesc: "QMP commands to run after the VM has started"
+:type: "blob"
+
+```
+
+```{config:option} raw.qemu.qmp.pre-start instance-raw
+:condition: "virtual machine"
+:liveupdate: "no"
+:shortdesc: "QMP commands to run after Incus QEMU initialization and before the VM has started"
+:type: "blob"
+
+```
+
+```{config:option} raw.qemu.scriptlet instance-raw
+:condition: "virtual machine"
+:liveupdate: "no"
+:shortdesc: "QEMU scriptlet to run at early, pre-start and post-start stages"
+:type: "string"
+
+```
+
 ```{config:option} raw.seccomp instance-raw
 :condition: "container"
 :liveupdate: "no"
@@ -745,7 +831,7 @@ See {ref}`instance-options-limits-hugepages` for more information.
 ```
 
 ```{config:option} limits.memory instance-resource-limits
-:defaultdesc: "`1Gib` (VMs)"
+:defaultdesc: "`1GiB` (VMs)"
 :liveupdate: "yes"
 :shortdesc: "Usage limit for the host's memory"
 :type: "string"
@@ -1096,7 +1182,9 @@ See {ref}`instance-options-snapshots-names` for more information.
 :liveupdate: "no"
 :shortdesc: "Schedule for automatic instance snapshots"
 :type: "string"
-Specify either a cron expression (`<minute> <hour> <dom> <month> <dow>`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots.
+Specify either a cron expression (`<minute> <hour> <dom> <month> <dow>`), a comma-and-space-separated list of schedule aliases (`@startup`, `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots.
+
+Note that unlike most other configuration keys, this one must be comma-and-space-separated and not just comma-separated as cron expression can themselves contain commas.
 
 ```
 
@@ -1271,6 +1359,13 @@ The hash of the image that the instance was created from (empty if the instance 
 :type: "string"
 The cluster group(s) that the instance was restricted to at creation time.
 This is used during re-scheduling events like an evacuation to keep the instance within the requested set.
+```
+
+```{config:option} volatile.container.oci instance-volatile
+:defaultdesc: "`false`"
+:shortdesc: "Whether the container is an OCI application container"
+:type: "bool"
+
 ```
 
 ```{config:option} volatile.cpu.nodes instance-volatile
@@ -1472,15 +1567,60 @@ User keys can be used in search.
 ```
 
 ```{config:option} ovn.transit.pattern network_integration-ovn
-:defaultdesc: "`ts-incus-{{ integrationName }}-{{ projectName }}-{{ networkname }}`"
+:defaultdesc: "`ts-incus-{{ integrationName }}-{{ projectName }}-{{ networkName }}`"
 :shortdesc: "Template for the transit switch name"
 :type: "string"
 Specify a Pongo2 template string that represents the transit switch name.
-This template gets access to the project name (`projectName`), integration name (`integrationName`) and network name (`networkName`).
+This template gets access to the project name (`projectName`),
+integration name (`integrationName`), network name (`networkName`)
+and peer name (`peerName`).
 
 ```
 
 <!-- config group network_integration-ovn end -->
+<!-- config group network_load_balancer-common start -->
+```{config:option} healthcheck network_load_balancer-common
+:defaultdesc: "`false`"
+:shortdesc: "Whether to perform checks on the backends"
+:type: "bool"
+
+```
+
+```{config:option} healthcheck.failure_count network_load_balancer-common
+:defaultdesc: "`3`"
+:shortdesc: "Number of failed tests to consider the backend offline"
+:type: "integer"
+
+```
+
+```{config:option} healthcheck.interval network_load_balancer-common
+:defaultdesc: "`10`"
+:shortdesc: "Interval in seconds between health checks"
+:type: "integer"
+
+```
+
+```{config:option} healthcheck.success_count network_load_balancer-common
+:defaultdesc: "`3`"
+:shortdesc: "Number of successful tests to consider the backend online"
+:type: "integer"
+
+```
+
+```{config:option} healthcheck.timeout network_load_balancer-common
+:defaultdesc: "`30`"
+:shortdesc: "Test timeout"
+:type: "integer"
+
+```
+
+```{config:option} user.* network_load_balancer-common
+:shortdesc: "Free form user key/value storage"
+:type: "string"
+User keys can be used in search.
+```
+
+<!-- config group network_load_balancer-common end -->
 <!-- config group network_zone-common start -->
 ```{config:option} dns.nameservers network_zone-common
 :required: "no"
@@ -1586,6 +1726,14 @@ This value is the maximum value for the sum of the individual {config:option}`in
 :shortdesc: "Maximum disk space used by the project"
 :type: "string"
 This value is the maximum value of the aggregate disk space used by all instance volumes, custom volumes, and images of the project.
+```
+
+```{config:option} limits.disk.pool.POOL_NAME project-limits
+:shortdesc: "Maximum disk space used by the project on this pool"
+:type: "string"
+This value is the maximum value of the aggregate disk
+space used by all instance volumes, custom volumes, and images of the
+project on this specific storage pool.
 ```
 
 ```{config:option} limits.instances project-limits
@@ -2243,6 +2391,22 @@ The events can be any combination of `lifecycle`, `logging`, and `network-acl`.
 Possible values are `bzip2`, `gzip`, `lzma`, `xz`, or `none`.
 ```
 
+```{config:option} instances.lxcfs.per_instance server-miscellaneous
+:defaultdesc: "`false`"
+:scope: "global"
+:shortdesc: "Whether to run LXCFS on a per-instance basis"
+:type: "bool"
+LXCFS is used to provide overlays for common `/proc` and `/sys`
+files which reflect the resource limits applied to the container.
+
+It normally operates through a single file system mount on the host which is then shared by all containers.
+This is very efficient but comes with the downside that a crash of LXCFS will break all containers.
+
+With this option, it's now possible to run a LXCFS instance per
+container instead, using more system resources but reducing the impact
+of a crash.
+```
+
 ```{config:option} instances.nic.host_name server-miscellaneous
 :defaultdesc: "`random`"
 :scope: "global"
@@ -2295,9 +2459,17 @@ See {ref}`clustering-instance-placement-scriptlet` for more information.
 ```
 
 ```{config:option} network.ovn.northbound_connection server-miscellaneous
-:defaultdesc: "`unix:/var/run/ovn/ovnnb_db.sock`"
+:defaultdesc: "`unix:/run/ovn/ovnnb_db.sock`"
 :scope: "global"
 :shortdesc: "OVN northbound database connection string"
+:type: "string"
+
+```
+
+```{config:option} network.ovs.connection server-miscellaneous
+:defaultdesc: "`unix:/run/openvswitch/db.sock`"
+:scope: "global"
+:shortdesc: "OVS socket path"
 :type: "string"
 
 ```
@@ -2342,6 +2514,13 @@ This value is required by some providers.
 ```{config:option} oidc.issuer server-oidc
 :scope: "global"
 :shortdesc: "OpenID Connect Discovery URL for the provider"
+:type: "string"
+
+```
+
+```{config:option} oidc.scopes server-oidc
+:scope: "global"
+:shortdesc: "Comma separated list of OpenID Connect scopes"
 :type: "string"
 
 ```

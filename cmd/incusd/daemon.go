@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -167,6 +168,14 @@ type Daemon struct {
 	// OVN clients.
 	ovnnb *ovn.NB
 	ovnsb *ovn.SB
+	ovnMu sync.Mutex
+
+	// OVS client.
+	ovs   *ovs.VSwitch
+	ovsMu sync.Mutex
+
+	// API info.
+	apiExtensions int
 }
 
 // DaemonConfig holds configuration values for Daemon.
@@ -196,6 +205,7 @@ func newDaemon(config *DaemonConfig, os *sys.OS) *Daemon {
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
 		shutdownDoneCh: make(chan error),
+		apiExtensions:  len(version.APIExtensions),
 	}
 
 	d.serverCert = func() *localtls.CertInfo { return d.serverCertInt }
@@ -345,7 +355,49 @@ func allowPermission(objectType auth.ObjectType, entitlement auth.Entitlement, m
 			return projectName
 		}
 
-		objectName, err := auth.ObjectFromRequest(r, objectType, expandProject, expandFingerprint, muxVars...)
+		// Expansion function for volume location.
+		expandVolumeLocation := func(projectName string, poolName string, volumeTypeName string, volumeName string) string {
+			// The location field is only relevant in clusters.
+			if !d.serverClustered {
+				return ""
+			}
+
+			var err error
+			var nodes []db.NodeInfo
+			var poolID int64
+
+			// Convert the volume type name to our internal integer representation.
+			volumeType, err := storagePools.VolumeTypeNameToDBType(volumeTypeName)
+			if err != nil {
+				return ""
+			}
+
+			// Get the server list for the volume.
+			err = d.db.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+				poolID, err = tx.GetStoragePoolID(ctx, poolName)
+				if err != nil {
+					return err
+				}
+
+				nodes, err = tx.GetStorageVolumeNodes(ctx, poolID, projectName, volumeName, volumeType)
+				if err != nil {
+					return err
+				}
+
+				return nil
+			})
+			if err != nil {
+				return ""
+			}
+
+			if len(nodes) != 1 {
+				return ""
+			}
+
+			return nodes[0].Name
+		}
+
+		objectName, err := auth.ObjectFromRequest(r, objectType, expandProject, expandFingerprint, expandVolumeLocation, muxVars...)
 		if err != nil {
 			return response.InternalError(fmt.Errorf("Failed to create authentication object: %w", err))
 		}
@@ -498,28 +550,29 @@ func (d *Daemon) State() *state.State {
 	d.globalConfigMu.Unlock()
 
 	return &state.State{
-		ShutdownCtx:            d.shutdownCtx,
-		DB:                     d.db,
+		Authorizer:             d.authorizer,
 		BGP:                    d.bgp,
+		Cluster:                d.gateway,
+		DB:                     d.db,
+		DevIncusEvents:         d.devIncusEvents,
+		DevMonitor:             d.devmonitor,
 		DNS:                    d.dns,
-		OS:                     d.os,
 		Endpoints:              d.endpoints,
 		Events:                 d.events,
-		DevIncusEvents:         d.devIncusEvents,
 		Firewall:               d.firewall,
+		GlobalConfig:           globalConfig,
+		InstanceTypes:          instanceTypes,
+		LocalConfig:            localConfig,
+		OS:                     d.os,
+		OVN:                    d.getOVN,
+		OVS:                    d.getOVS,
 		Proxy:                  d.proxy,
 		ServerCert:             d.serverCert,
-		UpdateCertificateCache: func() { updateCertificateCache(d) },
-		InstanceTypes:          instanceTypes,
-		DevMonitor:             d.devmonitor,
-		GlobalConfig:           globalConfig,
-		LocalConfig:            localConfig,
-		ServerName:             d.serverName,
 		ServerClustered:        d.serverClustered,
+		ServerName:             d.serverName,
+		ShutdownCtx:            d.shutdownCtx,
 		StartTime:              d.startTime,
-		Authorizer:             d.authorizer,
-		OVNNB:                  d.ovnnb,
-		OVNSB:                  d.ovnsb,
+		UpdateCertificateCache: func() { updateCertificateCache(d) },
 	}
 }
 
@@ -542,7 +595,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			select {
 			case <-d.setupChan:
 			default:
-				response := response.Unavailable(fmt.Errorf("Daemon setup in progress"))
+				response := response.Unavailable(fmt.Errorf("Daemon is starting up"))
 				_ = response.Render(w)
 				return
 			}
@@ -862,6 +915,14 @@ func (d *Daemon) init() error {
 	dbWarnings, err = d.os.Init()
 	if err != nil {
 		return err
+	}
+
+	// Initialize apparmor.
+	if d.os.AppArmorAvailable {
+		err := apparmor.Init()
+		if err != nil {
+			return fmt.Errorf("Failed to initialize apparmor: %v", err)
+		}
 	}
 
 	// Setup AppArmor wrapper.
@@ -1368,7 +1429,7 @@ func (d *Daemon) init() error {
 
 	d.gateway.HeartbeatOfflineThreshold = d.globalConfig.OfflineThreshold()
 	lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiInstance, lokiLoglevel, lokiLabels, lokiTypes := d.globalConfig.LokiServer()
-	oidcIssuer, oidcClientID, oidcAudience, oidcClaim := d.globalConfig.OIDCServer()
+	oidcIssuer, oidcClientID, oidcScope, oidcAudience, oidcClaim := d.globalConfig.OIDCServer()
 	syslogSocketEnabled := d.localConfig.SyslogSocket()
 	openfgaAPIURL, openfgaAPIToken, openfgaStoreID := d.globalConfig.OpenFGA()
 	instancePlacementScriptlet := d.globalConfig.InstancesPlacementScriptlet()
@@ -1394,7 +1455,7 @@ func (d *Daemon) init() error {
 
 	// Setup OIDC authentication.
 	if oidcIssuer != "" && oidcClientID != "" {
-		d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcAudience, oidcClaim)
+		d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcScope, oidcAudience, oidcClaim)
 		if err != nil {
 			return err
 		}
@@ -1418,9 +1479,6 @@ func (d *Daemon) init() error {
 
 		logger.Info("Started BGP server")
 	}
-
-	// Attempt to setup OVN clients.
-	_ = d.setupOVN()
 
 	// Setup DNS listener.
 	d.dns = dns.NewServer(d.db.Cluster, func(name string, full bool) (*dns.Zone, error) {
@@ -1653,10 +1711,10 @@ func (d *Daemon) startClusterTasks() {
 	d.taskClusterHeartbeat = d.clusterTasks.Add(cluster.HeartbeatTask(d.gateway))
 
 	// Auto-sync images across the cluster (hourly)
-	d.clusterTasks.Add(autoSyncImagesTask(d))
+	d.clusterTasks.Add(autoSyncImagesTask(d.State()))
 
 	// Remove orphaned operations
-	d.clusterTasks.Add(autoRemoveOrphanedOperationsTask(d))
+	d.clusterTasks.Add(autoRemoveOrphanedOperationsTask(d.State()))
 
 	// Perform automatic evacuation for offline cluster members
 	d.clusterTasks.Add(autoHealClusterTask(d))
@@ -2288,8 +2346,6 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 		return
 	}
 
-	localClusterAddress := s.LocalConfig.ClusterAddress()
-
 	if hbData.FullStateList {
 		// If there is an ongoing heartbeat round (and by implication this is the leader), then this could
 		// be a problem because it could be broadcasting the stale member state information which in turn
@@ -2309,7 +2365,56 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 			return
 		}
 
-		logger.Info("Partial heartbeat received", logger.Ctx{"local": localClusterAddress})
+		logger.Debug("Partial heartbeat received")
+	}
+
+	// Refresh cluster member resource info cache.
+	var muRefresh sync.Mutex
+
+	for _, member := range hbData.Members {
+		// Ignore offline servers.
+		if !member.Online {
+			continue
+		}
+
+		if member.Name == s.ServerName {
+			continue
+		}
+
+		go func(name string, address string) {
+			muRefresh.Lock()
+			defer muRefresh.Unlock()
+
+			// Check if we have a recent local cache entry already.
+			resourcesPath := internalUtil.CachePath("resources", fmt.Sprintf("%s.yaml", name))
+			fi, err := os.Stat(resourcesPath)
+			if err == nil && fi.ModTime().Before(time.Now().Add(time.Hour)) {
+				return
+			}
+
+			// Connect to the server.
+			client, err := cluster.Connect(address, s.Endpoints.NetworkCert(), s.ServerCert(), nil, true)
+			if err != nil {
+				return
+			}
+
+			// Get the server resources.
+			resources, err := client.GetServerResources()
+			if err != nil {
+				return
+			}
+
+			// Write to cache.
+			data, err := json.Marshal(resources)
+			if err != nil {
+				return
+			}
+
+			err = os.WriteFile(resourcesPath, data, 0600)
+			if err != nil {
+				return
+			}
+		}(member.Name, member.Address)
 	}
 }
 
@@ -2334,6 +2439,10 @@ func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader b
 		return
 	}
 
+	if heartbeatData.Version.MinAPIExtensions > 0 && heartbeatData.Version.MinAPIExtensions != d.apiExtensions {
+		d.apiExtensions = heartbeatData.Version.MinAPIExtensions
+	}
+
 	// If the max version of the cluster has changed, check whether we need to upgrade.
 	if d.lastNodeList == nil || d.lastNodeList.Version.APIExtensions != heartbeatData.Version.APIExtensions || d.lastNodeList.Version.Schema != heartbeatData.Version.Schema {
 		err := cluster.MaybeUpdate(s)
@@ -2353,7 +2462,7 @@ func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader b
 	}
 
 	if d.hasMemberStateChanged(heartbeatData) {
-		logger.Info("Cluster member state has changed", logger.Ctx{"local": localClusterAddress})
+		logger.Info("Cluster status has changed, refreshing")
 
 		// Refresh cluster certificates cached.
 		updateCertificateCache(d)
@@ -2436,12 +2545,15 @@ func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader b
 }
 
 func (d *Daemon) setupOVN() error {
+	d.ovnMu.Lock()
+	defer d.ovnMu.Unlock()
+
 	// Clear any existing clients.
 	d.ovnnb = nil
 	d.ovnsb = nil
 
 	// Connect to OpenVswitch.
-	vswitch, err := ovs.NewVSwitch()
+	vswitch, err := d.getOVS()
 	if err != nil {
 		return fmt.Errorf("Failed to connect to OVS: %w", err)
 	}
@@ -2497,4 +2609,45 @@ func (d *Daemon) setupOVN() error {
 	d.ovnsb = ovnsb
 
 	return nil
+}
+
+func (d *Daemon) getOVN() (*ovn.NB, *ovn.SB, error) {
+	if d.ovnnb == nil || d.ovnsb == nil {
+		err := d.setupOVN()
+		if err != nil {
+			return nil, nil, fmt.Errorf("Failed to connect to OVN: %w", err)
+		}
+	}
+
+	return d.ovnnb, d.ovnsb, nil
+}
+
+func (d *Daemon) setupOVS() error {
+	d.ovsMu.Lock()
+	defer d.ovsMu.Unlock()
+
+	// Clear any existing client.
+	d.ovs = nil
+
+	// Connect to OpenVswitch.
+	vswitch, err := ovs.NewVSwitch(d.localConfig.NetworkOVSConnection())
+	if err != nil {
+		return fmt.Errorf("Failed to connect to OVS: %w", err)
+	}
+
+	// Set the client.
+	d.ovs = vswitch
+
+	return nil
+}
+
+func (d *Daemon) getOVS() (*ovs.VSwitch, error) {
+	if d.ovs == nil {
+		err := d.setupOVS()
+		if err != nil {
+			return nil, fmt.Errorf("Failed to connect to OVS: %w", err)
+		}
+	}
+
+	return d.ovs, nil
 }

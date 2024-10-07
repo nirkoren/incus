@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 
+	"github.com/lxc/incus/v6/client"
 	internalInstance "github.com/lxc/incus/v6/internal/instance"
 	"github.com/lxc/incus/v6/internal/instancewriter"
 	internalIO "github.com/lxc/incus/v6/internal/io"
@@ -35,6 +36,7 @@ import (
 	"github.com/lxc/incus/v6/internal/server/cluster/request"
 	"github.com/lxc/incus/v6/internal/server/db"
 	"github.com/lxc/incus/v6/internal/server/db/cluster"
+	deviceConfig "github.com/lxc/incus/v6/internal/server/device/config"
 	"github.com/lxc/incus/v6/internal/server/instance"
 	"github.com/lxc/incus/v6/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v6/internal/server/lifecycle"
@@ -59,6 +61,11 @@ import (
 
 var unavailablePools = make(map[string]struct{})
 var unavailablePoolsMu = sync.Mutex{}
+
+// ConnectIfInstanceIsRemote is a reference to cluster.ConnectIfInstanceIsRemote.
+//
+//nolint:typecheck
+var ConnectIfInstanceIsRemote func(s *state.State, projectName string, instName string, r *http.Request, instanceType instancetype.Type) (incus.InstanceServer, error)
 
 // instanceDiskVolumeEffectiveFields fields from the instance disks that are applied to the volume's effective
 // config (but not stored in the disk's volume database record).
@@ -353,12 +360,14 @@ func (b *backend) Delete(clientType request.ClientType, op *operations.Operation
 	}
 
 	if clientType != request.ClientTypeNormal && b.driver.Info().Remote {
-		if b.driver.Info().MountedRoot {
+		if b.driver.Info().Deactivate || b.driver.Info().MountedRoot {
 			_, err := b.driver.Unmount()
 			if err != nil {
 				return err
 			}
-		} else {
+		}
+
+		if !b.driver.Info().MountedRoot {
 			// Remote storage may have leftover entries caused by
 			// volumes that were moved or delete while a particular system was offline.
 			err := os.RemoveAll(path)
@@ -395,7 +404,7 @@ func (b *backend) Delete(clientType request.ClientType, op *operations.Operation
 
 	// Delete the mountpoint.
 	err = os.Remove(path)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("Failed to remove directory %q: %w", path, err)
 	}
 
@@ -914,6 +923,12 @@ func (b *backend) CreateInstanceFromBackup(srcBackup backup.Info, srcData io.Rea
 		err = b.applyInstanceRootDiskOverrides(inst, &vol)
 		if err != nil {
 			return err
+		}
+
+		// Save any changes that have occurred to the instance's config to the on-disk backup.yaml file.
+		err = b.UpdateInstanceBackupFile(inst, false, op)
+		if err != nil {
+			return fmt.Errorf("Failed updating backup file: %w", err)
 		}
 
 		// If the driver returned a post hook, run it now.
@@ -1686,7 +1701,7 @@ func (b *backend) imageFiller(fingerprint string, op *operations.Operation) func
 			metadata := make(map[string]any)
 			tracker = &ioprogress.ProgressTracker{
 				Handler: func(percent, speed int64) {
-					operations.SetProgressMetadata(metadata, "create_instance_from_image_unpack", "Unpack", percent, 0, speed)
+					operations.SetProgressMetadata(metadata, "create_instance_from_image_unpack", "Unpacking image", percent, 0, speed)
 					_ = op.UpdateMetadata(metadata)
 				}}
 		}
@@ -4563,13 +4578,7 @@ func (b *backend) CreateCustomVolume(projectName string, volName string, desc st
 
 	// Get the volume name on storage.
 	volStorageName := project.StorageVolume(projectName, volName)
-
-	// Validate config.
 	vol := b.GetVolume(drivers.VolumeTypeCustom, contentType, volStorageName, config)
-	err = b.driver.ValidateVolume(vol, false)
-	if err != nil {
-		return err
-	}
 
 	storagePoolSupported := false
 	for _, supportedType := range b.Driver().Info().VolumeTypes {
@@ -4911,7 +4920,7 @@ func (b *backend) migrationIndexHeaderSend(l logger.Logger, indexHeaderVersion u
 			return nil, fmt.Errorf("Failed negotiating migration options: %w", err)
 		}
 
-		l.Info("Received migration index header response", logger.Ctx{"response": fmt.Sprintf("%+v", infoResp), "version": indexHeaderVersion})
+		l.Debug("Received migration index header response", logger.Ctx{"response": fmt.Sprintf("%+v", infoResp), "version": indexHeaderVersion})
 	}
 
 	return &infoResp, nil
@@ -4936,7 +4945,7 @@ func (b *backend) migrationIndexHeaderReceive(l logger.Logger, indexHeaderVersio
 			return nil, fmt.Errorf("Failed decoding migration index header: %w", err)
 		}
 
-		l.Info("Received migration index header, sending response", logger.Ctx{"version": indexHeaderVersion})
+		l.Debug("Received migration index header, sending response", logger.Ctx{"version": indexHeaderVersion})
 
 		infoResp := localMigration.InfoResponse{StatusCode: http.StatusOK, Refresh: &refresh}
 		headerJSON, err := json.Marshal(infoResp)
@@ -5360,7 +5369,7 @@ func (b *backend) UpdateCustomVolume(projectName string, volName string, newDesc
 
 		// Check that the volume's block.filesystem property isn't being changed.
 		if changedConfig["block.filesystem"] != "" {
-			return fmt.Errorf("Custom volume 'block.filesystem' property cannot be changed")
+			return fmt.Errorf(`Custom volume "block.filesystem" property cannot be changed`)
 		}
 
 		// Check for config changing that is not allowed when running instances are using it.
@@ -5429,6 +5438,80 @@ func (b *backend) UpdateCustomVolume(projectName string, volName string, newDesc
 	if util.IsTrue(newConfig["security.unmapped"]) {
 		delete(newConfig, "volatile.idmap.last")
 		delete(newConfig, "volatile.idmap.next")
+	}
+
+	// Notify instances of disk size changes as needed.
+	newSize, ok := changedConfig["size"]
+	if ok && newSize != "" && contentType == drivers.ContentTypeBlock {
+		// Get the disk size in bytes.
+		size, err := units.ParseByteSizeString(changedConfig["size"])
+		if err != nil {
+			return err
+		}
+
+		type instDevice struct {
+			args    db.InstanceArgs
+			devices []string
+		}
+
+		instDevices := []instDevice{}
+		err = VolumeUsedByInstanceDevices(b.state, b.name, projectName, &curVol.StorageVolume, true, func(dbInst db.InstanceArgs, project api.Project, usedByDevices []string) error {
+			if dbInst.Type != instancetype.VM {
+				return nil
+			}
+
+			instDevices = append(instDevices, instDevice{args: dbInst, devices: usedByDevices})
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range instDevices {
+			c, err := ConnectIfInstanceIsRemote(b.state, entry.args.Project, entry.args.Name, nil, entry.args.Type)
+			if err != nil {
+				return err
+			}
+
+			if c != nil {
+				// Send a remote notification.
+				devs := []string{}
+				for _, devName := range entry.devices {
+					devs = append(devs, fmt.Sprintf("%s:%d", devName, size))
+				}
+
+				uri := fmt.Sprintf("/internal/virtual-machines/%d/onresize?devices=%s", entry.args.ID, strings.Join(devs, ","))
+				_, _, err := c.RawQuery("GET", uri, nil, "")
+				if err != nil {
+					return err
+				}
+			} else {
+				// Update the local instance.
+				inst, err := instance.LoadByProjectAndName(b.state, entry.args.Project, entry.args.Name)
+				if err != nil {
+					return err
+				}
+
+				if !inst.IsRunning() {
+					continue
+				}
+
+				for _, devName := range entry.devices {
+					runConf := deviceConfig.RunConfig{}
+					runConf.Mounts = []deviceConfig.MountEntryItem{
+						{
+							DevName: devName,
+							Size:    size,
+						},
+					}
+
+					err = inst.DeviceEventHandler(&runConf)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
 
 	// Update the database if something changed.
@@ -6941,13 +7024,13 @@ func (b *backend) BackupCustomVolume(projectName string, volName string, tarWrit
 	l.Debug("BackupCustomVolume started")
 	defer l.Debug("BackupCustomVolume finished")
 
-	// Get the volume name on storage.
-	volStorageName := project.StorageVolume(projectName, volName)
-
 	volume, err := VolumeDBGet(b, projectName, volName, drivers.VolumeTypeCustom)
 	if err != nil {
 		return err
 	}
+
+	// Get the volume name on storage.
+	volStorageName := project.StorageVolume(projectName, volume.Name)
 
 	contentDBType, err := VolumeContentTypeNameToContentType(volume.ContentType)
 	if err != nil {
@@ -7004,7 +7087,7 @@ func (b *backend) CreateCustomVolumeFromISO(projectName string, volName string, 
 	}
 
 	err := b.state.DB.Cluster.Transaction(b.state.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-		return project.AllowVolumeCreation(tx, projectName, req)
+		return project.AllowVolumeCreation(tx, projectName, b.name, req)
 	})
 	if err != nil {
 		return fmt.Errorf("Failed checking volume creation allowed: %w", err)
@@ -7094,7 +7177,7 @@ func (b *backend) CreateCustomVolumeFromBackup(srcBackup backup.Info, srcData io
 	}
 
 	err := b.state.DB.Cluster.Transaction(b.state.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-		return project.AllowVolumeCreation(tx, srcBackup.Project, req)
+		return project.AllowVolumeCreation(tx, srcBackup.Project, b.name, req)
 	})
 	if err != nil {
 		return fmt.Errorf("Failed checking volume creation allowed: %w", err)

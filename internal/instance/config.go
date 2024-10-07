@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	scriptletLoad "github.com/lxc/incus/v6/internal/server/scriptlet/load"
 	"github.com/lxc/incus/v6/shared/api"
 	"github.com/lxc/incus/v6/shared/units"
 	"github.com/lxc/incus/v6/shared/validate"
@@ -28,6 +29,14 @@ var HugePageSizeSuffix = [...]string{"64KB", "1MB", "2MB", "1GB"}
 
 // InstanceConfigKeysAny is a map of config key to validator. (keys applying to containers AND virtual machines).
 var InstanceConfigKeysAny = map[string]func(value string) error{
+	// gendoc:generate(entity=instance, group=boot, key=boot.autorestart)
+	// If set to `true` will attempt up to 10 restarts over a 1 minute period upon unexpected instance exit.
+	// ---
+	//  type: bool
+	//  liveupdate: no
+	//  shortdesc: Whether to automatically restart an instance on unexpected exit
+	"boot.autorestart": validate.Optional(validate.IsBool),
+
 	// gendoc:generate(entity=instance, group=boot, key=boot.autostart)
 	// If set to `false`, restore the last state.
 	// ---
@@ -65,8 +74,10 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 
 	// gendoc:generate(entity=instance, group=boot, key=boot.host_shutdown_action)
 	// Action to take on host shut down
+	//
+	// Valid values are: `stop`, `force-stop` or `stateful-stop`
 	// ---
-	//  type: integer
+	//  type: string
 	//  defaultdesc: stop
 	//  liveupdate: yes
 	//  shortdesc: What action to take on the instance when the host is shut down
@@ -206,7 +217,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// See {ref}`instances-limit-units` for details.
 	// ---
 	//  type: string
-	//  defaultdesc: `1Gib` (VMs)
+	//  defaultdesc: `1GiB` (VMs)
 	//  liveupdate: yes
 	//  shortdesc: Usage limit for the host's memory
 	"limits.memory": func(value string) error {
@@ -286,7 +297,9 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	"security.protection.delete": validate.Optional(validate.IsBool),
 
 	// gendoc:generate(entity=instance, group=snapshots, key=snapshots.schedule)
-	// Specify either a cron expression (`<minute> <hour> <dom> <month> <dow>`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots.
+	// Specify either a cron expression (`<minute> <hour> <dom> <month> <dow>`), a comma-and-space-separated list of schedule aliases (`@startup`, `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots.
+	//
+	// Note that unlike most other configuration keys, this one must be comma-and-space-separated and not just comma-separated as cron expression can themselves contain commas.
 	//
 	// ---
 	//  type: string
@@ -866,6 +879,14 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 
 	"security.syscalls.whitelist": validate.IsAny,
 
+	// gendoc:generate(entity=instance, group=volatile, key=volatile.container.oci)
+	//
+	// ---
+	//  type: bool
+	//  defaultdesc: `false`
+	//  shortdesc: Whether the container is an OCI application container
+	"volatile.container.oci": validate.IsBool,
+
 	// gendoc:generate(entity=instance, group=volatile, key=volatile.last_state.idmap)
 	//
 	// ---
@@ -926,6 +947,42 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	//  condition: virtual machine
 	//  shortdesc: Addition/override to the generated `qemu.conf` file
 	"raw.qemu.conf": validate.IsAny,
+
+	// gendoc:generate(entity=instance, group=raw, key=raw.qemu.qmp.early)
+	//
+	// ---
+	//  type: blob
+	//  liveupdate: no
+	//  condition: virtual machine
+	//  shortdesc: QMP commands to run before Incus QEMU initialization
+	"raw.qemu.qmp.early": validate.IsAny,
+
+	// gendoc:generate(entity=instance, group=raw, key=raw.qemu.qmp.post-start)
+	//
+	// ---
+	//  type: blob
+	//  liveupdate: no
+	//  condition: virtual machine
+	//  shortdesc: QMP commands to run after the VM has started
+	"raw.qemu.qmp.post-start": validate.IsAny,
+
+	// gendoc:generate(entity=instance, group=raw, key=raw.qemu.qmp.pre-start)
+	//
+	// ---
+	//  type: blob
+	//  liveupdate: no
+	//  condition: virtual machine
+	//  shortdesc: QMP commands to run after Incus QEMU initialization and before the VM has started
+	"raw.qemu.qmp.pre-start": validate.IsAny,
+
+	// gendoc:generate(entity=instance, group=raw, key=raw.qemu.scriptlet)
+	//
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: virtual machine
+	//  shortdesc: QEMU scriptlet to run at early, pre-start and post-start stages
+	"raw.qemu.scriptlet": validate.Optional(scriptletLoad.QEMUValidate),
 
 	// gendoc:generate(entity=instance, group=security, key=security.agent.metrics)
 	//

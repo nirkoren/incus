@@ -189,32 +189,42 @@ func profilesGet(d *Daemon, r *http.Request) response.Response {
 			}
 		}
 
-		apiProfiles := make([]*api.Profile, 0, len(profiles))
-		for _, profile := range profiles {
-			if !userHasPermission(auth.ObjectProfile(p.Name, profile.Name)) {
-				continue
-			}
-
-			apiProfile, err := profile.ToAPI(ctx, tx.Tx())
-			if err != nil {
-				return err
-			}
-
-			apiProfile.UsedBy, err = profileUsedBy(ctx, tx, profile)
-			if err != nil {
-				return err
-			}
-
-			apiProfile.UsedBy = project.FilterUsedBy(s.Authorizer, r, apiProfile.UsedBy)
-			apiProfiles = append(apiProfiles, apiProfile)
-		}
-
 		if recursion {
+			profileDevices, err := dbCluster.GetDevices(ctx, tx.Tx(), "profile")
+			if err != nil {
+				return err
+			}
+
+			apiProfiles := make([]*api.Profile, 0, len(profiles))
+			for _, profile := range profiles {
+				if !userHasPermission(auth.ObjectProfile(p.Name, profile.Name)) {
+					continue
+				}
+
+				apiProfile, err := profile.ToAPI(ctx, tx.Tx(), profileDevices)
+				if err != nil {
+					return err
+				}
+
+				apiProfile.UsedBy, err = profileUsedBy(ctx, tx, profile)
+				if err != nil {
+					return err
+				}
+
+				apiProfile.UsedBy = project.FilterUsedBy(s.Authorizer, r, apiProfile.UsedBy)
+				apiProfiles = append(apiProfiles, apiProfile)
+			}
+
 			result = apiProfiles
 		} else {
-			urls := make([]string, len(apiProfiles))
-			for i, apiProfile := range apiProfiles {
-				urls[i] = apiProfile.URL(version.APIVersion, apiProfile.Project).String()
+			urls := make([]string, 0, len(profiles))
+			for _, profile := range profiles {
+				if !userHasPermission(auth.ObjectProfile(p.Name, profile.Name)) {
+					continue
+				}
+
+				apiProfile := api.Profile{Name: profile.Name}
+				urls = append(urls, apiProfile.URL(version.APIVersion, profile.Project).String())
 			}
 
 			result = urls
@@ -427,7 +437,12 @@ func profileGet(d *Daemon, r *http.Request) response.Response {
 			return fmt.Errorf("Fetch profile: %w", err)
 		}
 
-		resp, err = profile.ToAPI(ctx, tx.Tx())
+		profileDevices, err := dbCluster.GetDevices(ctx, tx.Tx(), "profile")
+		if err != nil {
+			return err
+		}
+
+		resp, err = profile.ToAPI(ctx, tx.Tx(), profileDevices)
 		if err != nil {
 			return err
 		}
@@ -518,7 +533,7 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 			return fmt.Errorf("Failed to retrieve profile %q: %w", name, err)
 		}
 
-		profile, err = current.ToAPI(ctx, tx.Tx())
+		profile, err = current.ToAPI(ctx, tx.Tx(), nil)
 		if err != nil {
 			return err
 		}
@@ -623,7 +638,7 @@ func profilePatch(d *Daemon, r *http.Request) response.Response {
 			return fmt.Errorf("Failed to retrieve profile=%q: %w", name, err)
 		}
 
-		profile, err = current.ToAPI(ctx, tx.Tx())
+		profile, err = current.ToAPI(ctx, tx.Tx(), nil)
 		if err != nil {
 			return err
 		}
@@ -768,10 +783,16 @@ func profilePost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Check that the profile exists.
+		_, err = dbCluster.GetProfile(ctx, tx.Tx(), p.Name, name)
+		if err != nil {
+			return fmt.Errorf("Profile %q doesn't exist", name)
+		}
+
 		// Check that the name isn't already in use.
 		_, err = dbCluster.GetProfile(ctx, tx.Tx(), p.Name, req.Name)
 		if err == nil {
-			return fmt.Errorf("Name %q already in use", req.Name)
+			return fmt.Errorf("Profile %q already exists", req.Name)
 		}
 
 		return dbCluster.RenameProfile(ctx, tx.Tx(), p.Name, name, req.Name)

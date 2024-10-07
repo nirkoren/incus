@@ -158,7 +158,9 @@ import "C"
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -242,6 +244,10 @@ func GetProject(path string) (uint32, error) {
 func SetProject(path string, id uint32) error {
 	err := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+
 			return err
 		}
 

@@ -29,7 +29,9 @@ import (
 	"github.com/flosch/pongo2"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/kballard/go-shellquote"
 	liblxc "github.com/lxc/go-lxc"
+	ociSpecs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/sftp"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
@@ -74,6 +76,7 @@ import (
 	internalUtil "github.com/lxc/incus/v6/internal/util"
 	"github.com/lxc/incus/v6/shared/api"
 	"github.com/lxc/incus/v6/shared/idmap"
+	"github.com/lxc/incus/v6/shared/ioprogress"
 	"github.com/lxc/incus/v6/shared/logger"
 	"github.com/lxc/incus/v6/shared/osarch"
 	"github.com/lxc/incus/v6/shared/subprocess"
@@ -164,7 +167,7 @@ func lxcStatusCode(state liblxc.State) api.StatusCode {
 
 // lxcCreate creates the DB storage records and sets up instance devices.
 // Returns a revert fail function that can be used to undo this function if a subsequent step fails.
-func lxcCreate(s *state.State, args db.InstanceArgs, p api.Project) (instance.Instance, revert.Hook, error) {
+func lxcCreate(s *state.State, args db.InstanceArgs, p api.Project, op *operations.Operation) (instance.Instance, revert.Hook, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -172,6 +175,7 @@ func lxcCreate(s *state.State, args db.InstanceArgs, p api.Project) (instance.In
 	d := &lxc{
 		common: common{
 			state: s,
+			op:    op,
 
 			architecture: args.Architecture,
 			creationDate: args.CreationDate,
@@ -1129,24 +1133,9 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 
 		// Configure the memory limits
 		if memory != "" {
-			var valueInt int64
-			if strings.HasSuffix(memory, "%") {
-				percent, err := strconv.ParseInt(strings.TrimSuffix(memory, "%"), 10, 64)
-				if err != nil {
-					return nil, err
-				}
-
-				memoryTotal, err := linux.DeviceTotalMemory()
-				if err != nil {
-					return nil, err
-				}
-
-				valueInt = int64((memoryTotal / 100) * percent)
-			} else {
-				valueInt, err = units.ParseByteSizeString(memory)
-				if err != nil {
-					return nil, err
-				}
+			valueInt, err := ParseMemoryStr(memory)
+			if err != nil {
+				return nil, err
 			}
 
 			if memoryEnforce == "soft" {
@@ -2018,7 +2007,7 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 	if util.PathExists(logfile) {
 		_ = os.Remove(logfile + ".old")
 		err := os.Rename(logfile, logfile+".old")
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return "", nil, err
 		}
 	}
@@ -2110,12 +2099,6 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 	if genUUID == "" {
 		genUUID = instUUID
 		volatileSet["volatile.uuid.generation"] = genUUID
-	}
-
-	// Apply any volatile changes that need to be made.
-	err = d.VolatileSet(volatileSet)
-	if err != nil {
-		return "", nil, fmt.Errorf("Failed setting volatile keys: %w", err)
 	}
 
 	// Create the devices
@@ -2312,6 +2295,223 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 		}
 	}
 
+	// Handle application containers.
+	if util.PathExists(filepath.Join(d.Path(), "config.json")) {
+		// Parse the OCI config.
+		data, err := os.ReadFile(filepath.Join(d.Path(), "config.json"))
+		if err != nil {
+			return "", nil, err
+		}
+
+		var config ociSpecs.Spec
+		err = json.Unmarshal([]byte(data), &config)
+		if err != nil {
+			return "", nil, err
+		}
+
+		// Mark the container as an OCI container if not already set.
+		if !util.IsTrue(d.expandedConfig["volatile.container.oci"]) {
+			volatileSet["volatile.container.oci"] = "true"
+		}
+
+		// Configure the entry point.
+		if len(config.Process.Args) > 0 && slices.Contains([]string{"/init", "/sbin/init", "/s6-init"}, config.Process.Args[0]) {
+			// For regular init systems, call them directly as PID1.
+			err = lxcSetConfigItem(cc, "lxc.init.cmd", shellquote.Join(config.Process.Args...))
+			if err != nil {
+				return "", nil, err
+			}
+		} else {
+			// For anything else, run them under our own PID1.
+			err = lxcSetConfigItem(cc, "lxc.execute.cmd", shellquote.Join(config.Process.Args...))
+			if err != nil {
+				return "", nil, err
+			}
+		}
+
+		err = lxcSetConfigItem(cc, "lxc.init.cwd", config.Process.Cwd)
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = lxcSetConfigItem(cc, "lxc.init.uid", fmt.Sprintf("%d", config.Process.User.UID))
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = lxcSetConfigItem(cc, "lxc.init.gid", fmt.Sprintf("%d", config.Process.User.GID))
+		if err != nil {
+			return "", nil, err
+		}
+
+		// Get all mounts so far.
+		lxcMounts := []string{"/dev", "/proc", "/sys", "/sys/fs/cgroup"}
+		for _, mount := range cc.ConfigItem("lxc.mount.entry") {
+			fields := strings.Split(mount, " ")
+			if len(fields) < 2 || fields[1][0] == '/' {
+				continue
+			}
+
+			lxcMounts = append(lxcMounts, fmt.Sprintf("/%s", fields[1]))
+		}
+
+		// Configure mounts.
+		for _, mount := range config.Mounts {
+			// We only support simple tmpfs at this stage.
+			if len(mount.UIDMappings) > 0 || len(mount.GIDMappings) > 0 || mount.Type != "tmpfs" {
+				continue
+			}
+
+			// Skip all our own mounts.
+			if slices.Contains(lxcMounts, mount.Destination) {
+				continue
+			}
+
+			err := lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s %s %s %s 0 0", mount.Source, strings.TrimLeft(mount.Destination, "/"), mount.Type, strings.Join(append(mount.Options, "create=dir"), ",")))
+			if err != nil {
+				return "", nil, err
+			}
+
+			lxcMounts = append(lxcMounts, mount.Destination)
+		}
+
+		// Mount /run as a tmpfs if it exists and isn't already mounted.
+		if !slices.Contains(lxcMounts, "/run") {
+			err := lxcSetConfigItem(cc, "lxc.mount.entry", "none run tmpfs none,mode=755,optional")
+			if err != nil {
+				return "", nil, err
+			}
+		}
+
+		// Configure network handling.
+		err = os.MkdirAll(filepath.Join(d.Path(), "network"), 0711)
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = os.MkdirAll(filepath.Join(d.RootfsPath(), "etc"), 0755)
+		if err != nil && !os.IsExist(err) {
+			return "", nil, err
+		}
+
+		err = os.WriteFile(filepath.Join(d.Path(), "network", "hosts"), []byte(fmt.Sprintf(`127.0.0.1   localhost
+127.0.1.1   %s
+
+::1     localhost ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+`, d.name)), 0644)
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s etc/hosts none bind,create=file", filepath.Join(d.Path(), "network", "hosts")))
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = os.WriteFile(filepath.Join(d.Path(), "network", "hostname"), []byte(fmt.Sprintf("%s\n", d.name)), 0644)
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s etc/hostname none bind,create=file", filepath.Join(d.Path(), "network", "hostname")))
+		if err != nil {
+			return "", nil, err
+		}
+
+		f, err := os.Create(filepath.Join(d.Path(), "network", "resolv.conf"))
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = f.Chmod(0644)
+		if err != nil {
+			f.Close()
+			return "", nil, err
+		}
+
+		f.Close()
+
+		err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s etc/resolv.conf none bind,create=file", filepath.Join(d.Path(), "network", "resolv.conf")))
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = lxcSetConfigItem(cc, "lxc.hook.start-host", fmt.Sprintf("/proc/%d/exe forknet dhcp %s", os.Getpid(), filepath.Join(d.Path(), "network")))
+		if err != nil {
+			return "", nil, err
+		}
+	} else {
+		// Clear OCI config key if present.
+		if d.expandedConfig["volatile.container.oci"] != "" {
+			volatileSet["volatile.container.oci"] = ""
+		}
+	}
+
+	// Check if we should start a dedicated LXCFS.
+	if d.state.GlobalConfig.InstancesLXCFSPerInstance() {
+		if !util.PathExists(filepath.Join(d.RunPath(), "lxcfs", "proc")) {
+			// Make sure all the paths exist.
+			err := os.Mkdir(filepath.Join(d.DevicesPath(), "lxcfs"), 0711)
+			if err != nil && !os.IsExist(err) {
+				return "", nil, err
+			}
+
+			err = os.Mkdir(filepath.Join(d.RunPath(), "lxcfs"), 0700)
+			if err != nil && !os.IsExist(err) {
+				return "", nil, err
+			}
+
+			// Prepare a new LXCFS instance.
+			args := []string{"-f",
+				"-p", filepath.Join(d.RunPath(), "lxcfs.pid"),
+				"--runtime-dir", filepath.Join(d.RunPath(), "lxcfs")}
+
+			if os.Getenv("LXCFS_OPTS") != "" {
+				userArgs, err := shellquote.Split(os.Getenv("LXCFS_OPTS"))
+				if err != nil {
+					return "", nil, err
+				}
+
+				args = append(args, userArgs...)
+			}
+
+			args = append(args, filepath.Join(d.DevicesPath(), "lxcfs"))
+
+			lxcfs, err := subprocess.NewProcess("lxcfs", args, "", "")
+			if err != nil {
+				return "", nil, err
+			}
+
+			// Start LXCFS.
+			err = lxcfs.Start(context.TODO())
+			if err != nil {
+				return "", nil, err
+			}
+
+			// Write down our process tracking.
+			err = lxcfs.Save(filepath.Join(d.RunPath(), "lxcfs.yaml"))
+			if err != nil {
+				return "", nil, err
+			}
+		}
+
+		// Over-mount the system LXCFS (if found).
+		for _, entry := range []string{"/var/lib/lxcfs", "/var/lib/incus-lxcfs"} {
+			if !util.PathExists(entry) {
+				continue
+			}
+
+			err = lxcSetConfigItem(cc, "lxc.hook.pre-mount", fmt.Sprintf("mount -o bind %s /var/lib/incus-lxcfs/", filepath.Join(d.DevicesPath(), "lxcfs")))
+			if err != nil {
+				return "", nil, err
+			}
+		}
+	}
+
 	// Load the LXC raw config.
 	err = d.loadRawLXCConfig(cc)
 	if err != nil {
@@ -2366,6 +2566,12 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 		}
 	}
 
+	// Apply any volatile changes that need to be made.
+	err = d.VolatileSet(volatileSet)
+	if err != nil {
+		return "", nil, fmt.Errorf("Failed setting volatile keys: %w", err)
+	}
+
 	// Update the backup.yaml file just before starting the instance process, but after all devices have been
 	// setup, so that the backup file contains the volatile keys used for this instance start, so that they
 	// can be used for instance cleanup.
@@ -2410,26 +2616,19 @@ func (d *lxc) Start(stateful bool) error {
 		return fmt.Errorf("Stateful start requires that the instance migration.stateful be set to true")
 	}
 
-	unlock, err := d.updateBackupFileLock(context.Background())
-	if err != nil {
-		return err
-	}
-
-	defer unlock()
-
 	d.logger.Debug("Start started", logger.Ctx{"stateful": stateful})
 	defer d.logger.Debug("Start finished", logger.Ctx{"stateful": stateful})
 
 	// Check that we are startable before creating an operation lock.
 	// Must happen before creating operation Start lock to avoid the status check returning Stopped due to the
 	// existence of a Start operation lock.
-	err = d.validateStartup(stateful, d.statusCode())
+	err := d.validateStartup(stateful, d.statusCode())
 	if err != nil {
 		return err
 	}
 
 	// Setup a new operation.
-	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionStart, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore}, false, false)
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), d.op, operationlock.ActionStart, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore}, false, false)
 	if err != nil {
 		if errors.Is(err, operationlock.ErrNonReusuableSucceeded) {
 			// An existing matching operation has now succeeded, return.
@@ -2683,7 +2882,7 @@ func (d *lxc) Stop(stateful bool) error {
 	}
 
 	// Setup a new operation
-	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionStop, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore}, false, true)
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), d.op, operationlock.ActionStop, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore, operationlock.ActionMigrate}, false, true)
 	if err != nil {
 		if errors.Is(err, operationlock.ErrNonReusuableSucceeded) {
 			// An existing matching operation has now succeeded, return.
@@ -2859,7 +3058,7 @@ func (d *lxc) Shutdown(timeout time.Duration) error {
 	}
 
 	// Setup a new operation
-	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionStop, []operationlock.Action{operationlock.ActionRestart}, true, true)
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), d.op, operationlock.ActionStop, []operationlock.Action{operationlock.ActionRestart}, true, true)
 	if err != nil {
 		if errors.Is(err, operationlock.ErrNonReusuableSucceeded) {
 			// An existing matching operation has now succeeded, return.
@@ -3021,6 +3220,11 @@ func (d *lxc) onStop(args map[string]string) error {
 		d.fromHook = false
 		err = nil
 
+		// Set operation if missing.
+		if d.op == nil {
+			d.op = op.GetOperation()
+		}
+
 		// Unlock on return
 		defer op.Done(nil)
 
@@ -3075,8 +3279,44 @@ func (d *lxc) onStop(args map[string]string) error {
 			return
 		}
 
+		// Stop dedicated LXCFS.
+		if util.PathExists(filepath.Join(d.DevicesPath(), "lxcfs", "proc")) && util.PathExists(filepath.Join(d.RunPath(), "lxcfs.yaml")) {
+			// Import the running LXCFS.
+			lxcfs, err := subprocess.ImportProcess(filepath.Join(d.RunPath(), "lxcfs.yaml"))
+			if err != nil && !os.IsExist(err) {
+				op.Done(fmt.Errorf("Failed to stop LXCFS: %w", err))
+				return
+			}
+
+			// Stop LXCFS.
+			err = lxcfs.Stop()
+			if err != nil && err != subprocess.ErrNotRunning {
+				op.Done(fmt.Errorf("Failed to stop LXCFS: %w", err))
+				return
+			}
+
+			_ = unix.Unmount(filepath.Join(d.DevicesPath(), "lxcfs"), unix.MNT_DETACH)
+		}
+
+		// Determine if instance should be auto-restarted.
+		var autoRestart bool
+		if target != "reboot" && op.GetInstanceInitiated() && d.shouldAutoRestart() {
+			autoRestart = true
+
+			// Mark current shutdown as complete.
+			op.Done(nil)
+
+			// Create a new restart operation.
+			op, err = operationlock.CreateWaitGet(d.Project().Name, d.Name(), d.op, operationlock.ActionRestart, nil, true, false)
+			if err == nil {
+				defer op.Done(nil)
+			} else {
+				d.logger.Error("Failed to setup new restart operation", logger.Ctx{"err": err})
+			}
+		}
+
 		// Log and emit lifecycle if not user triggered
-		if op.GetInstanceInitiated() {
+		if target != "reboot" && !autoRestart && op.GetInstanceInitiated() {
 			ctxMap := logger.Ctx{
 				"action":    target,
 				"created":   d.creationDate,
@@ -3090,7 +3330,7 @@ func (d *lxc) onStop(args map[string]string) error {
 		}
 
 		// Reboot the container
-		if target == "reboot" {
+		if target == "reboot" || autoRestart {
 			// Start the container again
 			err = d.Start(false)
 			if err != nil {
@@ -3180,7 +3420,7 @@ func (d *lxc) Freeze() error {
 
 	// Check if the CGroup is available
 	if !d.state.OS.CGInfo.Supports(cgroup.Freezer, cg) {
-		d.logger.Info("Unable to freeze container (lack of kernel support)", ctxMap)
+		d.logger.Warn("Unable to freeze container (lack of kernel support)", ctxMap)
 		return nil
 	}
 
@@ -3230,7 +3470,7 @@ func (d *lxc) Unfreeze() error {
 
 	// Check if the CGroup is available
 	if !d.state.OS.CGInfo.Supports(cgroup.Freezer, cg) {
-		d.logger.Info("Unable to unfreeze container (lack of kernel support)", ctxMap)
+		d.logger.Warn("Unable to unfreeze container (lack of kernel support)", ctxMap)
 		return nil
 	}
 
@@ -3539,13 +3779,6 @@ func (d *lxc) snapshot(name string, expiry time.Time, stateful bool) error {
 
 // Snapshot takes a new snapshot.
 func (d *lxc) Snapshot(name string, expiry time.Time, stateful bool) error {
-	unlock, err := d.updateBackupFileLock(context.Background())
-	if err != nil {
-		return err
-	}
-
-	defer unlock()
-
 	return d.snapshot(name, expiry, stateful)
 }
 
@@ -3553,7 +3786,7 @@ func (d *lxc) Snapshot(name string, expiry time.Time, stateful bool) error {
 func (d *lxc) Restore(sourceContainer instance.Instance, stateful bool) error {
 	var ctxMap logger.Ctx
 
-	op, err := operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestore, false, false)
+	op, err := operationlock.Create(d.Project().Name, d.Name(), d.op, operationlock.ActionRestore, false, false)
 	if err != nil {
 		return fmt.Errorf("Failed to create instance restore operation: %w", err)
 	}
@@ -3599,7 +3832,7 @@ func (d *lxc) Restore(sourceContainer instance.Instance, stateful bool) error {
 		}
 
 		// Refresh the operation as that one is now complete.
-		op, err = operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestore, false, false)
+		op, err = operationlock.Create(d.Project().Name, d.Name(), d.op, operationlock.ActionRestore, false, false)
 		if err != nil {
 			return fmt.Errorf("Failed to create instance restore operation: %w", err)
 		}
@@ -3717,7 +3950,7 @@ func (d *lxc) Restore(sourceContainer instance.Instance, stateful bool) error {
 
 		// Remove the state from the parent container; we only keep this in snapshots.
 		err2 := os.RemoveAll(d.StatePath())
-		if err2 != nil && !os.IsNotExist(err) {
+		if err2 != nil && !errors.Is(err, fs.ErrNotExist) {
 			op.Done(err)
 			return err
 		}
@@ -3766,15 +3999,8 @@ func (d *lxc) cleanup() {
 
 // Delete deletes the instance.
 func (d *lxc) Delete(force bool) error {
-	unlock, err := d.updateBackupFileLock(context.Background())
-	if err != nil {
-		return err
-	}
-
-	defer unlock()
-
 	// Setup a new operation.
-	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionDelete, nil, false, false)
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), d.op, operationlock.ActionDelete, nil, false, false)
 	if err != nil {
 		return fmt.Errorf("Failed to create instance delete operation: %w", err)
 	}
@@ -3921,13 +4147,6 @@ func (d *lxc) delete(force bool) error {
 
 // Rename renames the instance. Accepts an argument to enable applying deferred TemplateTriggerRename.
 func (d *lxc) Rename(newName string, applyTemplateTrigger bool) error {
-	unlock, err := d.updateBackupFileLock(context.Background())
-	if err != nil {
-		return err
-	}
-
-	defer unlock()
-
 	oldName := d.Name()
 	ctxMap := logger.Ctx{
 		"created":   d.creationDate,
@@ -3938,7 +4157,7 @@ func (d *lxc) Rename(newName string, applyTemplateTrigger bool) error {
 	d.logger.Info("Renaming instance", ctxMap)
 
 	// Quick checks.
-	err = instance.ValidName(newName, d.IsSnapshot())
+	err := instance.ValidName(newName, d.IsSnapshot())
 	if err != nil {
 		return err
 	}
@@ -4139,15 +4358,8 @@ func (d *lxc) CGroupSet(key string, value string) error {
 
 // Update applies updated config.
 func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
-	unlock, err := d.updateBackupFileLock(context.Background())
-	if err != nil {
-		return err
-	}
-
-	defer unlock()
-
 	// Setup a new operation
-	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionUpdate, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore}, false, false)
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), d.op, operationlock.ActionUpdate, []operationlock.Action{operationlock.ActionCreate, operationlock.ActionRestart, operationlock.ActionRestore}, false, false)
 	if err != nil {
 		return fmt.Errorf("Failed to create instance update operation: %w", err)
 	}
@@ -4587,20 +4799,8 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 				// Parse memory
 				if memory == "" {
 					memoryInt = -1
-				} else if strings.HasSuffix(memory, "%") {
-					percent, err := strconv.ParseInt(strings.TrimSuffix(memory, "%"), 10, 64)
-					if err != nil {
-						return err
-					}
-
-					memoryTotal, err := linux.DeviceTotalMemory()
-					if err != nil {
-						return err
-					}
-
-					memoryInt = int64((memoryTotal / 100) * percent)
 				} else {
-					memoryInt, err = units.ParseByteSizeString(memory)
+					memoryInt, err = ParseMemoryStr(memory)
 					if err != nil {
 						return err
 					}
@@ -4871,7 +5071,7 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 	}
 
 	err = d.UpdateBackupFile()
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("Failed to write backup file: %w", err)
 	}
 
@@ -4951,7 +5151,7 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 }
 
 // Export backs up the instance.
-func (d *lxc) Export(w io.Writer, properties map[string]string, expiration time.Time) (api.ImageMetadata, error) {
+func (d *lxc) Export(w io.Writer, properties map[string]string, expiration time.Time, tracker *ioprogress.ProgressTracker) (api.ImageMetadata, error) {
 	ctxMap := logger.Ctx{
 		"created":   d.creationDate,
 		"ephemeral": d.ephemeral,
@@ -5283,8 +5483,14 @@ fi
 }
 
 func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
-	d.logger.Info("Migration send starting")
-	defer d.logger.Info("Migration send stopped")
+	d.logger.Debug("Migration send starting")
+	defer d.logger.Debug("Migration send stopped")
+
+	// Setup a new operation.
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), d.op, operationlock.ActionMigrate, nil, false, true)
+	if err != nil {
+		return err
+	}
 
 	// Wait for essential migration connections before negotiation.
 	connectionsCtx, cancel := context.WithTimeout(context.Background(), time.Second*10)
@@ -5292,6 +5498,7 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 
 	filesystemConn, err := args.FilesystemConn(connectionsCtx)
 	if err != nil {
+		op.Done(err)
 		return err
 	}
 
@@ -5299,13 +5506,16 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 	if args.Live {
 		stateConn, err = args.StateConn(connectionsCtx)
 		if err != nil {
+			op.Done(err)
 			return err
 		}
 	}
 
 	pool, err := storagePools.LoadByInstance(d.state, d)
 	if err != nil {
-		return fmt.Errorf("Failed loading instance: %w", err)
+		err := fmt.Errorf("Failed loading instance: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	// The refresh argument passed to MigrationTypes() is always set to false here.
@@ -5313,7 +5523,9 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 	// sink/receiver will know this, and adjust the migration types accordingly.
 	poolMigrationTypes := pool.MigrationTypes(storagePools.InstanceContentType(d), false, args.Snapshots)
 	if len(poolMigrationTypes) == 0 {
-		return fmt.Errorf("No source migration types available")
+		err := fmt.Errorf("No source migration types available")
+		op.Done(err)
+		return err
 	}
 
 	// Convert the pool's migration type options to an offer header to target.
@@ -5343,7 +5555,9 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 	// Add idmap info to source header for containers.
 	idmapset, err := d.DiskIdmap()
 	if err != nil {
-		return fmt.Errorf("Failed getting container disk idmap: %w", err)
+		err := fmt.Errorf("Failed getting container disk idmap: %w", err)
+		op.Done(err)
+		return err
 	} else if idmapset != nil {
 		offerHeader.Idmap = make([]*migration.IDMapType, 0, len(idmapset.Entries))
 		for _, ctnIdmap := range idmapset.Entries {
@@ -5361,7 +5575,9 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 
 	srcConfig, err := pool.GenerateInstanceBackupConfig(d, args.Snapshots, d.op)
 	if err != nil {
-		return fmt.Errorf("Failed generating instance migration config: %w", err)
+		err := fmt.Errorf("Failed generating instance migration config: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	// If we are copying snapshots, retrieve a list of snapshots from source volume.
@@ -5379,7 +5595,9 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 	d.logger.Debug("Sending migration offer to target")
 	err = args.ControlSend(offerHeader)
 	if err != nil {
-		return fmt.Errorf("Failed sending migration offer: %w", err)
+		err := fmt.Errorf("Failed sending migration offer: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	// Receive response from target.
@@ -5387,7 +5605,9 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 	respHeader := &migration.MigrationHeader{}
 	err = args.ControlReceive(respHeader)
 	if err != nil {
-		return fmt.Errorf("Failed receiving migration offer response: %w", err)
+		err := fmt.Errorf("Failed receiving migration offer response: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	d.logger.Debug("Got migration offer response from target")
@@ -5395,7 +5615,9 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 	// Negotiated migration types.
 	migrationTypes, err := localMigration.MatchTypes(respHeader, migration.MigrationFSType_RSYNC, poolMigrationTypes)
 	if err != nil {
-		return fmt.Errorf("Failed to negotiate migration type: %w", err)
+		err := fmt.Errorf("Failed to negotiate migration type: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	volSourceArgs := &localMigration.VolumeSourceArgs{
@@ -5728,7 +5950,16 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 			}
 		}
 
-		return err
+		if err != nil {
+			op.Done(err)
+			return err
+		}
+
+		op.Done(nil)
+
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceMigrated.Event(d, nil))
+
+		return nil
 	}
 }
 
@@ -5870,8 +6101,8 @@ func (d *lxc) resetContainerDiskIdmap(srcIdmap *idmap.Set) error {
 }
 
 func (d *lxc) MigrateReceive(args instance.MigrateReceiveArgs) error {
-	d.logger.Info("Migration receive starting")
-	defer d.logger.Info("Migration receive stopped")
+	d.logger.Debug("Migration receive starting")
+	defer d.logger.Debug("Migration receive stopped")
 
 	// Wait for essential migration connections before negotiation.
 	connectionsCtx, cancel := context.WithTimeout(context.Background(), time.Second*10)
@@ -6205,7 +6436,7 @@ func (d *lxc) MigrateReceive(args instance.MigrateReceiveArgs) error {
 					}
 
 					// Create the snapshot instance.
-					_, snapInstOp, cleanup, err := instance.CreateInternal(d.state, *snapArgs, true, false)
+					_, snapInstOp, cleanup, err := instance.CreateInternal(d.state, *snapArgs, d.op, true, false)
 					if err != nil {
 						return fmt.Errorf("Failed creating instance snapshot record %q: %w", snapArgs.Name, err)
 					}
@@ -6594,7 +6825,7 @@ func (d *lxc) migrate(args *instance.CriuMigrationArgs) error {
 	if migrateErr != nil {
 		log, err2 := getCRIULogErrors(finalStateDir, prettyCmd)
 		if err2 == nil {
-			d.logger.Info("Failed migrating container", ctxMap)
+			d.logger.Warn("Failed migrating container", ctxMap)
 			migrateErr = fmt.Errorf("%s %s failed\n%s", args.Function, prettyCmd, log)
 		}
 
@@ -8159,7 +8390,7 @@ func (d *lxc) LockExclusive() (*operationlock.InstanceOperation, error) {
 	}
 
 	// Prevent concurrent operations the instance.
-	op, err := operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionCreate, false, false)
+	op, err := operationlock.Create(d.Project().Name, d.Name(), d.op, operationlock.ActionCreate, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -8342,6 +8573,15 @@ func (rw *lxcCgroupReadWriter) Set(version cgroup.Backend, controller string, ke
 
 // UpdateBackupFile writes the instance's backup.yaml file to storage.
 func (d *lxc) UpdateBackupFile() error {
+	// Prevent concurent updates to the backup file.
+	unlock, err := d.updateBackupFileLock(context.Background())
+	if err != nil {
+		return err
+	}
+
+	defer unlock()
+
+	// Write the current instance state to backup file.
 	pool, err := d.getStoragePool()
 	if err != nil {
 		return err
@@ -8585,9 +8825,20 @@ func (d *lxc) getFSStats() (*metrics.MetricSet, error) {
 				return nil, fmt.Errorf("Failed to stat %s: %w", mountpoint, err)
 			}
 
-			isMounted := false
+			// Grab the pool information to compare.
+			poolStatfs, err := linux.StatVFS(internalUtil.VarPath("storage-pools", dev["pool"]))
+			if err != nil {
+				return nil, fmt.Errorf("Failed to stat %s: %w", mountpoint, err)
+			}
+
+			// Check if we have actual mount-specific information.
+			if statfs.Type == poolStatfs.Type && statfs.Blocks == poolStatfs.Blocks && statfs.Bfree == poolStatfs.Bfree && statfs.Bavail == poolStatfs.Bavail {
+				continue
+			}
 
 			// Check if mountPath is in mountMap
+			isMounted := false
+
 			for mountDev, mountInfo := range mountMap {
 				if mountInfo.Mountpoint != mountpoint {
 					continue

@@ -16,6 +16,7 @@ import (
 	"github.com/lxc/incus/v6/shared/api"
 	config "github.com/lxc/incus/v6/shared/cliconfig"
 	"github.com/lxc/incus/v6/shared/units"
+	"github.com/lxc/incus/v6/shared/util"
 )
 
 type cmdInfo struct {
@@ -633,15 +634,20 @@ func (c *cmdInfo) instanceInfo(d incus.InstanceServer, remote config.Remote, nam
 
 	fmt.Printf(i18n.G("Status: %s")+"\n", strings.ToUpper(inst.Status))
 
-	if inst.Type == "" {
-		inst.Type = "container"
+	instType := inst.Type
+	if instType == "" {
+		instType = "container"
+	}
+
+	if util.IsTrue(inst.ExpandedConfig["volatile.container.oci"]) {
+		instType = fmt.Sprintf("%s (%s)", instType, i18n.G("application"))
 	}
 
 	if inst.Ephemeral {
-		fmt.Printf(i18n.G("Type: %s (ephemeral)")+"\n", inst.Type)
-	} else {
-		fmt.Printf(i18n.G("Type: %s")+"\n", inst.Type)
+		instType = fmt.Sprintf("%s (%s)", instType, i18n.G("ephemeral"))
 	}
+
+	fmt.Printf(i18n.G("Type: %s")+"\n", instType)
 
 	fmt.Printf(i18n.G("Architecture: %s")+"\n", inst.Architecture)
 
@@ -664,6 +670,17 @@ func (c *cmdInfo) instanceInfo(d incus.InstanceServer, remote config.Remote, nam
 	if inst.State.Pid != 0 {
 		if !inst.State.StartedAt.IsZero() {
 			fmt.Printf(i18n.G("Started: %s")+"\n", inst.State.StartedAt.Local().Format(dateLayout))
+		}
+
+		// Operating System info
+		if inst.State.OSInfo != nil {
+			fmt.Println("\n" + i18n.G("Operating System:"))
+			osInfo := fmt.Sprintf("  %s: %s\n", i18n.G("OS"), inst.State.OSInfo.OS)
+			osInfo += fmt.Sprintf("  %s: %s\n", i18n.G("OS Version"), inst.State.OSInfo.OSVersion)
+			osInfo += fmt.Sprintf("  %s: %s\n", i18n.G("Kernel Version"), inst.State.OSInfo.KernelVersion)
+			osInfo += fmt.Sprintf("  %s: %s\n", i18n.G("Hostname"), inst.State.OSInfo.Hostname)
+			osInfo += fmt.Sprintf("  %s: %s\n", i18n.G("FQDN"), inst.State.OSInfo.FQDN)
+			fmt.Print(osInfo)
 		}
 
 		fmt.Println("\n" + i18n.G("Resources:"))

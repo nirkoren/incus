@@ -1,7 +1,9 @@
 package drivers
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -9,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lxc/incus/v6/internal/linux"
@@ -25,6 +28,9 @@ import (
 )
 
 const lvmVgPoolMarker = "incus_pool" // Indicator tag used to mark volume groups as in use.
+
+var lvmExtentSize map[string]int64
+var lvmExtentSizeMu sync.Mutex
 
 var lvmLoaded bool
 var lvmVersion string
@@ -97,7 +103,10 @@ func (d *lvm) init(s *state.State, name string, config map[string]string, log lo
 	d.common.init(s, name, config, log, volIDFunc, commonRules)
 
 	if d.clustered && d.config != nil {
-		d.config["lvm.vg_name"] = d.config["source"]
+		_, exists := d.config["lvm.vg_name"]
+		if !exists {
+			d.config["lvm.vg_name"] = d.name
+		}
 	}
 }
 
@@ -121,12 +130,14 @@ func (d *lvm) Info() Info {
 		PreservesInodes:              false,
 		Remote:                       d.isRemote(),
 		VolumeTypes:                  []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeMultiNode:              d.isRemote(),
 		BlockBacking:                 true,
 		RunningCopyFreeze:            true,
 		DirectIO:                     true,
 		IOUring:                      true,
 		MountedRoot:                  false,
-		Buckets:                      true,
+		Buckets:                      !d.isRemote(),
+		Deactivate:                   d.isRemote(),
 	}
 }
 
@@ -161,10 +172,6 @@ func (d *lvm) Create() error {
 	var usingLoopFile bool
 
 	if d.config["source"] == "" || d.config["source"] == defaultSource {
-		if d.clustered {
-			return fmt.Errorf("Clustered LVM only supports pre-existing shared VGs")
-		}
-
 		usingLoopFile = true
 
 		// We are using an internal loopback file.
@@ -228,10 +235,6 @@ func (d *lvm) Create() error {
 			return fmt.Errorf("A volume group already exists called %q", d.config["lvm.vg_name"])
 		}
 	} else if filepath.IsAbs(d.config["source"]) {
-		if d.clustered {
-			return fmt.Errorf("Clustered LVM only supports pre-existing shared VGs")
-		}
-
 		// We are using an existing physical device.
 		srcPath := d.config["source"]
 
@@ -363,7 +366,20 @@ func (d *lvm) Create() error {
 				return fmt.Errorf("No name for physical volume detected")
 			}
 
-			_, err := subprocess.TryRunCommand("pvcreate", pvName)
+			args := []string{}
+
+			metadataSizeBytes, err := d.roundedSizeBytesString(d.config["lvm.metadata_size"])
+			if err != nil {
+				return fmt.Errorf("Invalid lvm.metadata_size: %w", err)
+			}
+
+			if metadataSizeBytes > 0 {
+				args = append(args, "--metadatasize", fmt.Sprintf("%db", metadataSizeBytes))
+			}
+
+			args = append(args, pvName)
+
+			_, err = subprocess.TryRunCommand("pvcreate", args...)
 			if err != nil {
 				return err
 			}
@@ -372,7 +388,13 @@ func (d *lvm) Create() error {
 		}
 
 		// Create volume group.
-		_, err := subprocess.TryRunCommand("vgcreate", d.config["lvm.vg_name"], pvName)
+		args := []string{d.config["lvm.vg_name"], pvName}
+
+		if d.clustered {
+			args = append(args, "--shared")
+		}
+
+		_, err := subprocess.TryRunCommand("vgcreate", args...)
 		if err != nil {
 			return err
 		}
@@ -489,7 +511,9 @@ func (d *lvm) Delete(op *operations.Operation) error {
 
 		// Remove volume group if needed.
 		if removeVg {
-			_, err := subprocess.TryRunCommand("vgremove", "-f", d.config["lvm.vg_name"])
+			// When deleting a shared VG, it may take more than a minute for the previously released shared locks to clear.
+			_, err := subprocess.TryRunCommandAttemptsDuration(240, 500*time.Millisecond, "vgremove", "-f", d.config["lvm.vg_name"])
+
 			if err != nil {
 				return fmt.Errorf("Failed to delete the volume group for the lvm storage pool: %w", err)
 			}
@@ -524,7 +548,7 @@ func (d *lvm) Delete(op *operations.Operation) error {
 
 		// This is a loop file so deconfigure the associated loop device.
 		err = os.Remove(d.config["source"])
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("Error removing LVM pool loop file %q: %w", d.config["source"], err)
 		}
 
@@ -542,7 +566,8 @@ func (d *lvm) Delete(op *operations.Operation) error {
 
 func (d *lvm) Validate(config map[string]string) error {
 	rules := map[string]func(value string) error{
-		"lvm.vg_name": validate.IsAny,
+		"lvm.vg_name":       validate.IsAny,
+		"lvm.metadata_size": validate.Optional(validate.IsSize),
 	}
 
 	if !d.clustered {
@@ -581,6 +606,11 @@ func (d *lvm) Update(changedConfig map[string]string) error {
 	_, changed = changedConfig["lvm.thinpool_metadata_size"]
 	if changed {
 		return fmt.Errorf("lvm.thinpool_metadata_size cannot be changed")
+	}
+
+	_, changed = changedConfig["lvm.metadata_size"]
+	if changed {
+		return fmt.Errorf("lvm.metadata_size cannot be changed")
 	}
 
 	_, changed = changedConfig["volume.lvm.stripes"]
@@ -672,7 +702,7 @@ func (d *lvm) Mount() (bool, error) {
 		return false, fmt.Errorf("Cannot mount pool as %q is not specified", "lvm.vg_name")
 	}
 
-	// Check if VG exists before we do anthing, this will indicate if its our mount or not.
+	// Check if VG exists before we do anything, this will indicate if its our mount or not.
 	vgExists, _, _ := d.volumeGroupExists(d.config["lvm.vg_name"])
 	ourMount := !vgExists
 
@@ -683,7 +713,7 @@ func (d *lvm) Mount() (bool, error) {
 
 	// If clustered LVM, start lock manager.
 	if d.clustered {
-		_, err := subprocess.RunCommand("vgchange", "--lockstart")
+		_, err := subprocess.RunCommand("vgchange", "--lockstart", d.config["lvm.vg_name"])
 		if err != nil {
 			return false, fmt.Errorf("Error starting lock manager: %w", err)
 		}
@@ -741,8 +771,15 @@ func (d *lvm) Mount() (bool, error) {
 }
 
 // Unmount unmounts the storage pool (this does nothing).
-// LVM doesn't currently support unmounting, please see https://github.com/lxc/incus/issues/9278
+// LVM doesn't currently support unmounting, please see https://github.com/canonical/lxd/issues/9278
 func (d *lvm) Unmount() (bool, error) {
+	if d.clustered {
+		_, err := subprocess.RunCommand("vgchange", "--lockstop", d.config["lvm.vg_name"])
+		if err != nil {
+			return false, fmt.Errorf("Error stopping lock manager: %w", err)
+		}
+	}
+
 	return false, nil
 }
 
@@ -800,21 +837,14 @@ func (d *lvm) GetResources() (*api.ResourcesStoragePool, error) {
 	return &res, nil
 }
 
-// roundVolumeBlockSizeBytes returns size rounded to the nearest multiple of the volume group extent size that is
-// equal to or larger than sizeBytes.
-func (d *lvm) roundVolumeBlockSizeBytes(sizeBytes int64) int64 {
+// roundVolumeBlockSizeBytes returns sizeBytes rounded up to the next multiple
+// of the volume group extent size.
+func (d *lvm) roundVolumeBlockSizeBytes(vol Volume, sizeBytes int64) (int64, error) {
 	// Get the volume group's physical extent size, and use that as minimum size.
-	vgExtentSize, _ := d.volumeGroupExtentSize(d.config["lvm.vg_name"])
-	if sizeBytes < vgExtentSize {
-		sizeBytes = vgExtentSize
+	vgExtentSize, err := d.volumeGroupExtentSize(d.config["lvm.vg_name"])
+	if err != nil {
+		return -1, err
 	}
 
-	roundedSizeBytes := int64(sizeBytes/vgExtentSize) * vgExtentSize
-
-	// Ensure the rounded size is at least the size specified in sizeBytes.
-	if roundedSizeBytes < sizeBytes {
-		roundedSizeBytes += vgExtentSize
-	}
-
-	return roundedSizeBytes
+	return roundAbove(vgExtentSize, sizeBytes), nil
 }

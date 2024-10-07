@@ -2,7 +2,9 @@ package resources
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -136,7 +138,7 @@ func getCPUCache(path string) ([]api.ResourcesCPUCache, error) {
 		// Get the cache size
 		content, err := os.ReadFile(filepath.Join(entryPath, "size"))
 		if err != nil {
-			if !os.IsNotExist(err) {
+			if !errors.Is(err, fs.ErrNotExist) {
 				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "size"), err)
 			}
 		} else {
@@ -160,7 +162,7 @@ func getCPUCache(path string) ([]api.ResourcesCPUCache, error) {
 		// Get the cache type
 		cacheType, err := os.ReadFile(filepath.Join(entryPath, "type"))
 		if err != nil {
-			if !os.IsNotExist(err) {
+			if !errors.Is(err, fs.ErrNotExist) {
 				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "type"), err)
 			}
 		} else {
@@ -235,11 +237,7 @@ func GetCPU() (*api.ResourcesCPU, error) {
 		return nil, fmt.Errorf("Failed to list %q: %w", sysDevicesCPU, err)
 	}
 
-	// CPU flags
-	var flagList []string
-
-	// Process all entries
-	cpu.Total = 0
+	threadIDs := make([]int64, 0, len(entries))
 	for _, entry := range entries {
 		entryName := entry.Name()
 		entryPath := filepath.Join(sysDevicesCPU, entryName)
@@ -249,19 +247,39 @@ func GetCPU() (*api.ResourcesCPU, error) {
 			continue
 		}
 
+		idStr := strings.TrimPrefix(entryName, "cpu")
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		threadIDs = append(threadIDs, id)
+	}
+
+	sort.Slice(threadIDs, func(i, j int) bool { return threadIDs[i] < threadIDs[j] })
+
+	// CPU flags
+	var flagList []string
+
+	// Process all entries
+	cpu.Total = 0
+	for _, threadID := range threadIDs {
+		entryName := fmt.Sprintf("cpu%d", threadID)
+		entryPath := filepath.Join(sysDevicesCPU, entryName)
+
 		// Get topology
 		cpuSocket, err := readInt(filepath.Join(entryPath, "topology", "physical_package_id"))
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "topology", "physical_package_id"), err)
 		}
 
 		cpuCore, err := readInt(filepath.Join(entryPath, "topology", "core_id"))
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "topology", "core_id"), err)
 		}
 
 		cpuDie, err := readInt(filepath.Join(entryPath, "topology", "die_id"))
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "topology", "die_id"), err)
 		}
 
@@ -470,20 +488,30 @@ func GetCPU() (*api.ResourcesCPU, error) {
 
 	// Asemble the data
 	cpu.Sockets = []api.ResourcesCPUSocket{}
-	for _, socket := range cpuSockets {
-		// Initialize core list
+	for _, k := range sortedMapKeys(cpuSockets) {
+		socket := cpuSockets[k]
+
+		// Initialize core list.
 		socket.Cores = []api.ResourcesCPUCore{}
 
-		// Add the cores
+		// Keep track of core frequency.
 		coreFrequency := uint64(0)
 		coreFrequencyCount := uint64(0)
+
+		// Add the cores.
+		cores := map[int64]api.ResourcesCPUCore{}
+
 		for _, core := range cpuCores[int64(socket.Socket)] {
 			if core.Frequency > 0 {
 				coreFrequency += core.Frequency
 				coreFrequencyCount++
 			}
 
-			socket.Cores = append(socket.Cores, *core)
+			cores[int64(core.Core)] = *core
+		}
+
+		for _, k := range sortedMapKeys(cores) {
+			socket.Cores = append(socket.Cores, cores[k])
 		}
 
 		// Record average frequency

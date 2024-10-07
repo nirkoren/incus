@@ -29,7 +29,7 @@ definitions:
         description: Certificate represents a certificate
         properties:
             certificate:
-                description: The certificate itself, as PEM encoded X509
+                description: The certificate itself, as PEM encoded X509 (or as base64 encoded X509 on POST)
                 example: X509 PEM certificate
                 type: string
                 x-go-name: Certificate
@@ -109,7 +109,7 @@ definitions:
         description: CertificatePut represents the modifiable fields of a certificate
         properties:
             certificate:
-                description: The certificate itself, as PEM encoded X509
+                description: The certificate itself, as PEM encoded X509 (or as base64 encoded X509 on POST)
                 example: X509 PEM certificate
                 type: string
                 x-go-name: Certificate
@@ -149,7 +149,7 @@ definitions:
         description: CertificatesPost represents the fields of a new certificate
         properties:
             certificate:
-                description: The certificate itself, as PEM encoded X509
+                description: The certificate itself, as PEM encoded X509 (or as base64 encoded X509 on POST)
                 example: X509 PEM certificate
                 type: string
                 x-go-name: Certificate
@@ -234,6 +234,14 @@ definitions:
         x-go-package: github.com/lxc/incus/v6/shared/api
     ClusterGroup:
         properties:
+            config:
+                additionalProperties:
+                    type: string
+                description: Cluster group configuration map
+                example:
+                    user.mykey: foo
+                type: object
+                x-go-name: Config
             description:
                 description: The description of the cluster group
                 example: amd64 servers
@@ -268,6 +276,14 @@ definitions:
         x-go-package: github.com/lxc/incus/v6/shared/api
     ClusterGroupPut:
         properties:
+            config:
+                additionalProperties:
+                    type: string
+                description: Cluster group configuration map
+                example:
+                    user.mykey: foo
+                type: object
+                x-go-name: Config
             description:
                 description: The description of the cluster group
                 example: amd64 servers
@@ -287,6 +303,14 @@ definitions:
         x-go-package: github.com/lxc/incus/v6/shared/api
     ClusterGroupsPost:
         properties:
+            config:
+                additionalProperties:
+                    type: string
+                description: Cluster group configuration map
+                example:
+                    user.mykey: foo
+                type: object
+                x-go-name: Config
             description:
                 description: The description of the cluster group
                 example: amd64 servers
@@ -2137,6 +2161,8 @@ definitions:
                 description: Network usage key/value pairs
                 type: object
                 x-go-name: Network
+            os_info:
+                $ref: '#/definitions/InstanceStateOSInfo'
             pid:
                 description: PID of the runtime
                 example: 7281
@@ -2349,6 +2375,36 @@ definitions:
                 format: int64
                 type: integer
                 x-go-name: PacketsSent
+        type: object
+        x-go-package: github.com/lxc/incus/v6/shared/api
+    InstanceStateOSInfo:
+        properties:
+            fqdn:
+                description: FQDN of the instance.
+                example: myhost.mydomain.local
+                type: string
+                x-go-name: FQDN
+            hostname:
+                description: Hostname of the instance.
+                example: myhost
+                type: string
+                x-go-name: Hostname
+            kernel_version:
+                description: Version of the kernel running in the instance.
+                example: 6.1.0-25-amd64
+                type: string
+                x-go-name: KernelVersion
+            os:
+                description: Operating system running in the instance.
+                example: Debian GNU/Linux
+                type: string
+                x-go-name: OS
+            os_version:
+                description: Version of the operating system.
+                example: 12 (bookworm)
+                type: string
+                x-go-name: OSVersion
+        title: InstanceStateOSInfo represents the operating system information section of an instance's state.
         type: object
         x-go-package: github.com/lxc/incus/v6/shared/api
     InstanceStatePut:
@@ -3188,6 +3244,44 @@ definitions:
                     $ref: '#/definitions/NetworkLoadBalancerPort'
                 type: array
                 x-go-name: Ports
+        type: object
+        x-go-package: github.com/lxc/incus/v6/shared/api
+    NetworkLoadBalancerState:
+        description: NetworkLoadBalancerState is used for showing current state of a load balancer
+        properties:
+            backend_health:
+                additionalProperties:
+                    $ref: '#/definitions/NetworkLoadBalancerStateBackendHealth'
+                type: object
+                x-go-name: BackendHealth
+        type: object
+        x-go-package: github.com/lxc/incus/v6/shared/api
+    NetworkLoadBalancerStateBackendHealth:
+        description: NetworkLoadBalancerStateBackendHealth represents the health of a particular load-balancer backend
+        properties:
+            address:
+                type: string
+                x-go-name: Address
+            ports:
+                items:
+                    $ref: '#/definitions/NetworkLoadBalancerStateBackendHealthPort'
+                type: array
+                x-go-name: Ports
+        type: object
+        x-go-package: github.com/lxc/incus/v6/shared/api
+    NetworkLoadBalancerStateBackendHealthPort:
+        properties:
+            port:
+                format: int64
+                type: integer
+                x-go-name: Port
+            protocol:
+                type: string
+                x-go-name: Protocol
+            status:
+                type: string
+                x-go-name: Status
+        title: NetworkLoadBalancerStateBackendHealthPort represents the health status of a particular load-balancer backend port.
         type: object
         x-go-package: github.com/lxc/incus/v6/shared/api
     NetworkLoadBalancersPost:
@@ -5711,6 +5805,14 @@ definitions:
                 readOnly: true
                 type: array
                 x-go-name: AuthMethods
+            config:
+                additionalProperties:
+                    type: string
+                description: Server configuration map (refer to doc/server.md)
+                example:
+                    core.https_address: :8443
+                type: object
+                x-go-name: Config
             public:
                 description: Whether the server is public-only (only public endpoints are implemented)
                 example: false
@@ -6023,79 +6125,6 @@ definitions:
         title: StoragePoolState represents the state of a storage pool.
         type: object
         x-go-package: github.com/lxc/incus/v6/shared/api
-    StoragePoolVolumeBackup:
-        description: StoragePoolVolumeBackup represents a volume backup
-        properties:
-            created_at:
-                description: When the backup was created
-                example: "2021-03-23T16:38:37.753398689-04:00"
-                format: date-time
-                type: string
-                x-go-name: CreatedAt
-            expires_at:
-                description: When the backup expires (gets auto-deleted)
-                example: "2021-03-23T17:38:37.753398689-04:00"
-                format: date-time
-                type: string
-                x-go-name: ExpiresAt
-            name:
-                description: Backup name
-                example: backup0
-                type: string
-                x-go-name: Name
-            optimized_storage:
-                description: Whether to use a pool-optimized binary format (instead of plain tarball)
-                example: true
-                type: boolean
-                x-go-name: OptimizedStorage
-            volume_only:
-                description: Whether to ignore snapshots
-                example: false
-                type: boolean
-                x-go-name: VolumeOnly
-        type: object
-        x-go-package: github.com/lxc/incus/v6/shared/api
-    StoragePoolVolumeBackupPost:
-        description: StoragePoolVolumeBackupPost represents the fields available for the renaming of a volume backup
-        properties:
-            name:
-                description: New backup name
-                example: backup1
-                type: string
-                x-go-name: Name
-        type: object
-        x-go-package: github.com/lxc/incus/v6/shared/api
-    StoragePoolVolumeBackupsPost:
-        description: StoragePoolVolumeBackupsPost represents the fields available for a new volume backup
-        properties:
-            compression_algorithm:
-                description: What compression algorithm to use
-                example: gzip
-                type: string
-                x-go-name: CompressionAlgorithm
-            expires_at:
-                description: When the backup expires (gets auto-deleted)
-                example: "2021-03-23T17:38:37.753398689-04:00"
-                format: date-time
-                type: string
-                x-go-name: ExpiresAt
-            name:
-                description: Backup name
-                example: backup0
-                type: string
-                x-go-name: Name
-            optimized_storage:
-                description: Whether to use a pool-optimized binary format (instead of plain tarball)
-                example: true
-                type: boolean
-                x-go-name: OptimizedStorage
-            volume_only:
-                description: Whether to ignore snapshots
-                example: false
-                type: boolean
-                x-go-name: VolumeOnly
-        type: object
-        x-go-package: github.com/lxc/incus/v6/shared/api
     StoragePoolsPost:
         description: StoragePoolsPost represents the fields of a new storage pool
         properties:
@@ -6186,6 +6215,79 @@ definitions:
                 type: array
                 x-go-name: UsedBy
         title: StorageVolume represents the fields of a storage volume.
+        type: object
+        x-go-package: github.com/lxc/incus/v6/shared/api
+    StorageVolumeBackup:
+        description: StorageVolumeBackup represents a volume backup
+        properties:
+            created_at:
+                description: When the backup was created
+                example: "2021-03-23T16:38:37.753398689-04:00"
+                format: date-time
+                type: string
+                x-go-name: CreatedAt
+            expires_at:
+                description: When the backup expires (gets auto-deleted)
+                example: "2021-03-23T17:38:37.753398689-04:00"
+                format: date-time
+                type: string
+                x-go-name: ExpiresAt
+            name:
+                description: Backup name
+                example: backup0
+                type: string
+                x-go-name: Name
+            optimized_storage:
+                description: Whether to use a pool-optimized binary format (instead of plain tarball)
+                example: true
+                type: boolean
+                x-go-name: OptimizedStorage
+            volume_only:
+                description: Whether to ignore snapshots
+                example: false
+                type: boolean
+                x-go-name: VolumeOnly
+        type: object
+        x-go-package: github.com/lxc/incus/v6/shared/api
+    StorageVolumeBackupPost:
+        description: StorageVolumeBackupPost represents the fields available for the renaming of a volume backup
+        properties:
+            name:
+                description: New backup name
+                example: backup1
+                type: string
+                x-go-name: Name
+        type: object
+        x-go-package: github.com/lxc/incus/v6/shared/api
+    StorageVolumeBackupsPost:
+        description: StorageVolumeBackupsPost represents the fields available for a new volume backup
+        properties:
+            compression_algorithm:
+                description: What compression algorithm to use
+                example: gzip
+                type: string
+                x-go-name: CompressionAlgorithm
+            expires_at:
+                description: When the backup expires (gets auto-deleted)
+                example: "2021-03-23T17:38:37.753398689-04:00"
+                format: date-time
+                type: string
+                x-go-name: ExpiresAt
+            name:
+                description: Backup name
+                example: backup0
+                type: string
+                x-go-name: Name
+            optimized_storage:
+                description: Whether to use a pool-optimized binary format (instead of plain tarball)
+                example: true
+                type: boolean
+                x-go-name: OptimizedStorage
+            volume_only:
+                description: Whether to ignore snapshots
+                example: false
+                type: boolean
+                x-go-name: VolumeOnly
         type: object
         x-go-package: github.com/lxc/incus/v6/shared/api
     StorageVolumePost:
@@ -12423,6 +12525,46 @@ paths:
             summary: Update the network address load balancer
             tags:
                 - network-load-balancers
+    /1.0/networks/{networkName}/load-balancers/{listenAddress}/state:
+        get:
+            description: Get the current state of a specific network address load balancer.
+            operationId: network_load_balancer_state_get
+            parameters:
+                - description: Project name
+                  example: default
+                  in: query
+                  name: project
+                  type: string
+            produces:
+                - application/json
+            responses:
+                "200":
+                    description: Load Balancer state
+                    schema:
+                        description: Sync response
+                        properties:
+                            metadata:
+                                $ref: '#/definitions/NetworkLoadBalancerState'
+                            status:
+                                description: Status description
+                                example: Success
+                                type: string
+                            status_code:
+                                description: Status code
+                                example: 200
+                                type: integer
+                            type:
+                                description: Response type
+                                example: sync
+                                type: string
+                        type: object
+                "403":
+                    $ref: '#/responses/Forbidden'
+                "500":
+                    $ref: '#/responses/InternalServerError'
+            summary: Get the network address load balancer state
+            tags:
+                - network-load-balancers
     /1.0/networks/{networkName}/load-balancers?recursion=1:
         get:
             description: Returns a list of network address load balancers (structs).
@@ -14348,7 +14490,7 @@ paths:
                   name: bucket
                   required: true
                   schema:
-                    $ref: '#/definitions/StoragePoolBucketBackupsPost'
+                    $ref: '#/definitions/StorageBucketBackupsPost'
             produces:
                 - application/json
             responses:
@@ -14417,7 +14559,7 @@ paths:
                         description: Sync response
                         properties:
                             metadata:
-                                $ref: '#/definitions/StoragePoolBucketBackup'
+                                $ref: '#/definitions/StorageBucketBackup'
                             status:
                                 description: Status description
                                 example: Success
@@ -14527,7 +14669,7 @@ paths:
                             metadata:
                                 description: List of storage bucket backups
                                 items:
-                                    $ref: '#/definitions/StoragePoolBucketBackup'
+                                    $ref: '#/definitions/StorageBucketBackup'
                                 type: array
                             status:
                                 description: Status description
@@ -15217,7 +15359,7 @@ paths:
                   name: volume
                   required: true
                   schema:
-                    $ref: '#/definitions/StoragePoolVolumeBackupsPost'
+                    $ref: '#/definitions/StorageVolumeBackupsPost'
             produces:
                 - application/json
             responses:
@@ -15286,7 +15428,7 @@ paths:
                         description: Sync response
                         properties:
                             metadata:
-                                $ref: '#/definitions/StoragePoolVolumeBackup'
+                                $ref: '#/definitions/StorageVolumeBackup'
                             status:
                                 description: Status description
                                 example: Success
@@ -15396,7 +15538,7 @@ paths:
                             metadata:
                                 description: List of storage volume backups
                                 items:
-                                    $ref: '#/definitions/StoragePoolVolumeBackup'
+                                    $ref: '#/definitions/StorageVolumeBackup'
                                 type: array
                             status:
                                 description: Status description

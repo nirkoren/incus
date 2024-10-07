@@ -105,6 +105,7 @@ type Volume struct {
 	mountCustomPath      string // Mount the filesystem volume at a custom location.
 	mountFilesystemProbe bool   // Probe filesystem type when mounting volume (when needed).
 	hasSource            bool   // Whether the volume is created from a source volume.
+	isDeleted            bool   // Whether we're dealing with a hidden volume (kept until all references are gone).
 }
 
 // NewVolume instantiates a new Volume struct.
@@ -530,7 +531,10 @@ func (v Volume) ConfigSizeFromSource(srcVol Volume) (string, error) {
 		// directly usable with the same size setting without also rounding for this check.
 		// Because we are not altering the actual size returned to use for the new volume, this will not
 		// affect storage drivers that do not use rounding.
-		volSizeBytes = v.driver.roundVolumeBlockSizeBytes(volSizeBytes)
+		volSizeBytes, err = v.driver.roundVolumeBlockSizeBytes(v, volSizeBytes)
+		if err != nil {
+			return volSize, err
+		}
 
 		// The volume/pool specified size is smaller than image minimum size. We must not continue as
 		// these specified sizes provide protection against unpacking a massive image and filling the pool.

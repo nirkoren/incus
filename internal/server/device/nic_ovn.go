@@ -3,7 +3,9 @@ package device
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -25,7 +27,6 @@ import (
 	"github.com/lxc/incus/v6/internal/server/network"
 	"github.com/lxc/incus/v6/internal/server/network/acl"
 	"github.com/lxc/incus/v6/internal/server/network/ovn"
-	"github.com/lxc/incus/v6/internal/server/network/ovs"
 	"github.com/lxc/incus/v6/internal/server/project"
 	"github.com/lxc/incus/v6/internal/server/resources"
 	"github.com/lxc/incus/v6/internal/server/state"
@@ -33,6 +34,7 @@ import (
 	"github.com/lxc/incus/v6/shared/api"
 	"github.com/lxc/incus/v6/shared/logger"
 	"github.com/lxc/incus/v6/shared/util"
+	"github.com/lxc/incus/v6/shared/validate"
 )
 
 // ovnNet defines an interface for accessing instance specific functions on OVN network.
@@ -51,6 +53,9 @@ type nicOVN struct {
 	deviceCommon
 
 	network ovnNet // Populated in validateConfig().
+
+	ovnnb *ovn.NB
+	ovnsb *ovn.SB
 }
 
 // CanHotPlug returns whether the device can be managed whilst the instance is running.
@@ -101,6 +106,7 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 		"security.acls.default.egress.action",
 		"security.acls.default.ingress.logged",
 		"security.acls.default.egress.logged",
+		"security.promiscuous",
 		"acceleration",
 		"nested",
 		"vlan",
@@ -141,7 +147,7 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 	d.network = ovnNet // Stored loaded network for use by other functions.
 	netConfig := d.network.Config()
 
-	if d.config["ipv4.address"] != "" {
+	if d.config["ipv4.address"] != "" && d.config["ipv4.address"] != "none" {
 		// Check that DHCPv4 is enabled on parent network (needed to use static assigned IPs).
 		if n.DHCPv4Subnet() == nil {
 			return fmt.Errorf("Cannot specify %q when DHCP is disabled on network %q", "ipv4.address", d.config["network"])
@@ -164,7 +170,7 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 		}
 	}
 
-	if d.config["ipv6.address"] != "" {
+	if d.config["ipv6.address"] != "" && d.config["ipv6.address"] != "none" {
 		// Check that DHCPv6 is enabled on parent network (needed to use static assigned IPs).
 		if n.DHCPv6Subnet() == nil || util.IsFalseOrEmpty(netConfig["ipv6.dhcp.stateful"]) {
 			return fmt.Errorf("Cannot specify %q when DHCP or %q are disabled on network %q", "ipv6.address", "ipv6.dhcp.stateful", d.config["network"])
@@ -249,6 +255,23 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 
 	rules := nicValidationRules(requiredFields, optionalFields, instConf)
 
+	// Override ipv4.address and ipv6.address to allow none value.
+	rules["ipv4.address"] = validate.Optional(func(value string) error {
+		if value == "none" {
+			return nil
+		}
+
+		return validate.IsNetworkAddressV4(value)
+	})
+
+	rules["ipv6.address"] = validate.Optional(func(value string) error {
+		if value == "none" {
+			return nil
+		}
+
+		return validate.IsNetworkAddressV6(value)
+	})
+
 	// Now run normal validation.
 	err = d.config.Validate(rules)
 	if err != nil {
@@ -293,6 +316,11 @@ func (d *nicOVN) checkAddressConflict() error {
 	ourNICIPs := make(map[string]net.IP, 2)
 	ourNICIPs["ipv4.address"] = net.ParseIP(d.config["ipv4.address"])
 	ourNICIPs["ipv6.address"] = net.ParseIP(d.config["ipv6.address"])
+
+	// Shortcut when no IP needs to be assigned.
+	if ourNICIPs["ipv4.address"] == nil && ourNICIPs["ipv6.address"] == nil {
+		return nil
+	}
 
 	ourNICMAC, _ := net.ParseMAC(d.config["hwaddr"])
 	if ourNICMAC == nil {
@@ -383,9 +411,13 @@ func (d *nicOVN) validateEnvironment() error {
 
 func (d *nicOVN) init(inst instance.Instance, s *state.State, name string, conf deviceConfig.Device, volatileGet VolatileGetter, volatileSet VolatileSetter) error {
 	// Check that OVN is available.
-	if s.OVNNB == nil {
-		return fmt.Errorf("OVN isn't currently available")
+	ovnnb, ovnsb, err := s.OVN()
+	if err != nil {
+		return err
 	}
+
+	d.ovnnb = ovnnb
+	d.ovnsb = ovnsb
 
 	return d.deviceCommon.init(inst, s, name, conf, volatileGet, volatileSet)
 }
@@ -405,16 +437,20 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 
 	// Load uplink network config.
 	uplinkNetworkName := d.network.Config()["network"]
-
 	var uplink *api.Network
+	var uplinkConfig map[string]string
 
-	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-		_, uplink, _, err = tx.GetNetworkInAnyState(ctx, api.ProjectDefaultName, uplinkNetworkName)
+	if uplinkNetworkName != "none" {
+		err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			_, uplink, _, err = tx.GetNetworkInAnyState(ctx, api.ProjectDefaultName, uplinkNetworkName)
 
-		return err
-	})
-	if err != nil {
-		return nil, fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
+			return err
+		})
+		if err != nil {
+			return nil, fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
+		}
+
+		uplinkConfig = uplink.Config
 	}
 
 	// Setup the host network interface (if not nested).
@@ -428,7 +464,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 		delete(saveData, "host_name") // Nested NICs don't have a host side interface.
 	} else {
 		if d.config["acceleration"] == "sriov" {
-			vswitch, err := ovs.NewVSwitch()
+			vswitch, err := d.state.OVS()
 			if err != nil {
 				return nil, fmt.Errorf("Failed to connect to OVS: %w", err)
 			}
@@ -484,7 +520,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 			integrationBridgeNICName = vfRepresentor
 			peerName = vfDev
 		} else if d.config["acceleration"] == "vdpa" {
-			vswitch, err := ovs.NewVSwitch()
+			vswitch, err := d.state.OVS()
 			if err != nil {
 				return nil, fmt.Errorf("Failed to connect to OVS: %w", err)
 			}
@@ -604,7 +640,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 		DNSName:      d.inst.Name(),
 		DeviceName:   d.name,
 		DeviceConfig: d.config,
-		UplinkConfig: uplink.Config,
+		UplinkConfig: uplinkConfig,
 		LastStateIPs: lastStateIPs, // Pass in volatile last state IPs for use with sticky DHCPv4 hint.
 	}, nil)
 	if err != nil {
@@ -635,7 +671,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 
 	// Associated host side interface to OVN logical switch port (if not nested).
 	if integrationBridgeNICName != "" {
-		cleanup, err := d.setupHostNIC(integrationBridgeNICName, logicalPortName, uplink)
+		cleanup, err := d.setupHostNIC(integrationBridgeNICName, logicalPortName)
 		if err != nil {
 			return nil, err
 		}
@@ -646,7 +682,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 	runConf := deviceConfig.RunConfig{}
 
 	// Get local chassis ID for chassis group.
-	vswitch, err := ovs.NewVSwitch()
+	vswitch, err := d.state.OVS()
 	if err != nil {
 		return nil, fmt.Errorf("Failed to connect to OVS: %w", err)
 	}
@@ -658,7 +694,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 
 	// Add post start hook for setting logical switch port chassis once instance has been started.
 	runConf.PostHooks = append(runConf.PostHooks, func() error {
-		err := d.state.OVNNB.UpdateLogicalSwitchPortOptions(context.TODO(), logicalPortName, map[string]string{"requested-chassis": chassisID})
+		err := d.ovnnb.UpdateLogicalSwitchPortOptions(context.TODO(), logicalPortName, map[string]string{"requested-chassis": chassisID})
 		if err != nil {
 			return fmt.Errorf("Failed setting logical switch port chassis ID: %w", err)
 		}
@@ -775,27 +811,31 @@ func (d *nicOVN) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 		if isRunning {
 			// Load uplink network config.
 			uplinkNetworkName := d.network.Config()["network"]
-
 			var uplink *api.Network
+			var uplinkConfig map[string]string
 
-			err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-				var err error
+			if uplinkNetworkName != "none" {
+				err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+					var err error
 
-				_, uplink, _, err = tx.GetNetworkInAnyState(ctx, api.ProjectDefaultName, uplinkNetworkName)
+					_, uplink, _, err = tx.GetNetworkInAnyState(ctx, api.ProjectDefaultName, uplinkNetworkName)
 
-				return err
-			})
-			if err != nil {
-				return fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
+					return err
+				})
+				if err != nil {
+					return fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
+				}
+
+				uplinkConfig = uplink.Config
 			}
 
 			// Update OVN logical switch port for instance.
-			_, _, err = d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
+			_, _, err := d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
 				InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
 				DNSName:      d.inst.Name(),
 				DeviceName:   d.name,
 				DeviceConfig: d.config,
-				UplinkConfig: uplink.Config,
+				UplinkConfig: uplinkConfig,
 			}, removedACLs)
 			if err != nil {
 				return fmt.Errorf("Failed updating OVN port: %w", err)
@@ -803,7 +843,7 @@ func (d *nicOVN) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 		}
 
 		if len(removedACLs) > 0 {
-			err := acl.OVNPortGroupDeleteIfUnused(d.state, d.logger, d.state.OVNNB, d.network.Project(), d.inst, d.name, newACLs...)
+			err := acl.OVNPortGroupDeleteIfUnused(d.state, d.logger, d.ovnnb, d.network.Project(), d.inst, d.name, newACLs...)
 			if err != nil {
 				return fmt.Errorf("Failed removing unused OVN port groups: %w", err)
 			}
@@ -865,7 +905,7 @@ func (d *nicOVN) Stop() (*deviceConfig.RunConfig, error) {
 	// port name using the same regime it does for new ports. This part is only here in order to allow
 	// instance ports generated under an older regime to be cleaned up properly.
 	networkVethFillFromVolatile(d.config, v)
-	vswitch, err := ovs.NewVSwitch()
+	vswitch, err := d.state.OVS()
 	if err != nil {
 		d.logger.Error("Failed to connect to OVS", logger.Ctx{"err": err})
 	}
@@ -1006,7 +1046,7 @@ func (d *nicOVN) Remove() error {
 	// Check for port groups that will become unused (and need deleting) as this NIC is deleted.
 	securityACLs := util.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)
 	if len(securityACLs) > 0 {
-		err := acl.OVNPortGroupDeleteIfUnused(d.state, d.logger, d.state.OVNNB, d.network.Project(), d.inst, d.name)
+		err := acl.OVNPortGroupDeleteIfUnused(d.state, d.logger, d.ovnnb, d.network.Project(), d.inst, d.name)
 		if err != nil {
 			return fmt.Errorf("Failed removing unused OVN port groups: %w", err)
 		}
@@ -1064,7 +1104,7 @@ func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
 			d.logger.Warn("Failed getting OVN port device IPs", logger.Ctx{"err": err})
 		}
 	} else {
-		if d.config["ipv4.address"] != "" {
+		if d.config["ipv4.address"] != "" && d.config["ipv4.address"] != "none" {
 			// Static DHCPv4 allocation present, that is likely to be the NIC's IPv4. So assume that.
 			addresses = append(addresses, api.InstanceStateNetworkAddress{
 				Family:  "inet",
@@ -1074,7 +1114,7 @@ func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
 			})
 		}
 
-		if d.config["ipv6.address"] != "" {
+		if d.config["ipv6.address"] != "" && d.config["ipv4.address"] != "none" {
 			// Static DHCPv6 allocation present, that is likely to be the NIC's IPv6. So assume that.
 			addresses = append(addresses, api.InstanceStateNetworkAddress{
 				Family:  "inet6",
@@ -1138,7 +1178,24 @@ func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
 
 // Register sets up anything needed on startup.
 func (d *nicOVN) Register() error {
-	err := bgpAddPrefix(&d.deviceCommon, d.network, d.config)
+	// Skip when not using a managed network.
+	if d.config["network"] == "" {
+		return nil
+	}
+
+	// The NIC's network may be a non-default project, so lookup project and get network's project name.
+	networkProjectName, _, err := project.NetworkProject(d.state.DB.Cluster, d.inst.Project().Name)
+	if err != nil {
+		return fmt.Errorf("Failed loading network project name: %w", err)
+	}
+
+	// Lookup network settings and apply them to the device's config.
+	n, err := network.LoadByName(d.state, networkProjectName, d.config["network"])
+	if err != nil {
+		return fmt.Errorf("Error loading network config for %q: %w", d.config["network"], err)
+	}
+
+	err = bgpAddPrefix(&d.deviceCommon, n, d.config)
 	if err != nil {
 		return err
 	}
@@ -1146,14 +1203,14 @@ func (d *nicOVN) Register() error {
 	return nil
 }
 
-func (d *nicOVN) setupHostNIC(hostName string, ovnPortName ovn.OVNSwitchPort, uplink *api.Network) (revert.Hook, error) {
+func (d *nicOVN) setupHostNIC(hostName string, ovnPortName ovn.OVNSwitchPort) (revert.Hook, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
 	// Disable IPv6 on host-side veth interface (prevents host-side interface getting link-local address and
 	// accepting router advertisements) as not needed because the host-side interface is connected to a bridge.
 	err := localUtil.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", hostName), "1")
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 
@@ -1166,7 +1223,7 @@ func (d *nicOVN) setupHostNIC(hostName string, ovnPortName ovn.OVNSwitchPort, up
 	// Attach host side veth interface to bridge.
 	integrationBridge := d.state.GlobalConfig.NetworkOVNIntegrationBridge()
 
-	vswitch, err := ovs.NewVSwitch()
+	vswitch, err := d.state.OVS()
 	if err != nil {
 		return nil, fmt.Errorf("Failed to connect to OVS: %w", err)
 	}

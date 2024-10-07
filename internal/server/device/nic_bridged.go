@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"math/rand"
 	"net"
 	"net/http"
@@ -29,7 +31,6 @@ import (
 	"github.com/lxc/incus/v6/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v6/internal/server/ip"
 	"github.com/lxc/incus/v6/internal/server/network"
-	"github.com/lxc/incus/v6/internal/server/network/ovs"
 	"github.com/lxc/incus/v6/internal/server/resources"
 	localUtil "github.com/lxc/incus/v6/internal/server/util"
 	internalUtil "github.com/lxc/incus/v6/internal/util"
@@ -553,7 +554,7 @@ func (d *nicBridged) Start() (*deviceConfig.RunConfig, error) {
 	// Disable IPv6 on host-side veth interface (prevents host-side interface getting link-local address)
 	// which isn't needed because the host-side interface is connected to a bridge.
 	err = localUtil.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", saveData["host_name"]), "1")
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 
@@ -566,16 +567,16 @@ func (d *nicBridged) Start() (*deviceConfig.RunConfig, error) {
 	revert.Add(r)
 
 	// Attach host side veth interface to bridge.
-	err = network.AttachInterface(d.config["parent"], saveData["host_name"])
+	err = network.AttachInterface(d.state, d.config["parent"], saveData["host_name"])
 	if err != nil {
 		return nil, err
 	}
 
-	revert.Add(func() { _ = network.DetachInterface(d.config["parent"], saveData["host_name"]) })
+	revert.Add(func() { _ = network.DetachInterface(d.state, d.config["parent"], saveData["host_name"]) })
 
 	// Attempt to disable router advertisement acceptance.
 	err = localUtil.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/accept_ra", saveData["host_name"]), "0")
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 
@@ -824,7 +825,7 @@ func (d *nicBridged) postStop() error {
 
 	if d.config["host_name"] != "" && network.InterfaceExists(d.config["host_name"]) {
 		// Detach host-side end of veth pair from bridge (required for openvswitch particularly).
-		err := network.DetachInterface(d.config["parent"], d.config["host_name"])
+		err := network.DetachInterface(d.state, d.config["parent"], d.config["host_name"])
 		if err != nil {
 			return fmt.Errorf("Failed to detach interface %q from %q: %w", d.config["host_name"], d.config["parent"], err)
 		}
@@ -908,7 +909,7 @@ func (d *nicBridged) rebuildDnsmasqEntry() error {
 	if (util.IsTrue(d.config["security.ipv4_filtering"]) && ipv4Address == "") || (util.IsTrue(d.config["security.ipv6_filtering"]) && ipv6Address == "") {
 		deviceStaticFileName := dnsmasq.StaticAllocationFileName(d.inst.Project().Name, d.inst.Name(), d.Name())
 		_, curIPv4, curIPv6, err := dnsmasq.DHCPStaticAllocation(d.config["parent"], deviceStaticFileName)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 
@@ -1009,7 +1010,7 @@ func (d *nicBridged) removeFilters(m deviceConfig.Device) {
 	deviceStaticFileName := dnsmasq.StaticAllocationFileName(d.inst.Project().Name, d.inst.Name(), d.Name())
 	_, IPv4Alloc, IPv6Alloc, err := dnsmasq.DHCPStaticAllocation(m["parent"], deviceStaticFileName)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return
 		}
 
@@ -1537,7 +1538,7 @@ func (d *nicBridged) setupNativeBridgePortVLANs(hostName string) error {
 
 // setupOVSBridgePortVLANs configures the bridge port with the specified VLAN settings on the openvswitch bridge.
 func (d *nicBridged) setupOVSBridgePortVLANs(hostName string) error {
-	vswitch, err := ovs.NewVSwitch()
+	vswitch, err := d.state.OVS()
 	if err != nil {
 		return fmt.Errorf("Failed to connect to OVS: %w", err)
 	}
@@ -1752,7 +1753,19 @@ func (d *nicBridged) getHostMTU() (int, error) {
 
 // Register sets up anything needed on startup.
 func (d *nicBridged) Register() error {
-	err := bgpAddPrefix(&d.deviceCommon, d.network, d.config)
+	// Skip when not using a managed network.
+	if d.config["network"] == "" {
+		return nil
+	}
+
+	// Load managed network. api.ProjectDefaultName is used here as bridge networks don't support projects.
+	n, err := network.LoadByName(d.state, api.ProjectDefaultName, d.config["network"])
+	if err != nil {
+		return fmt.Errorf("Error loading network config for %q: %w", d.config["network"], err)
+	}
+
+	// Add BGP prefix.
+	err = bgpAddPrefix(&d.deviceCommon, n, d.config)
 	if err != nil {
 		return err
 	}

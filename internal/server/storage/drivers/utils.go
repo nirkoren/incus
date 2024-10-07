@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -36,7 +37,7 @@ func wipeDirectory(path string) error {
 	// List all entries.
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 
@@ -47,7 +48,7 @@ func wipeDirectory(path string) error {
 	for _, entry := range entries {
 		entryPath := filepath.Join(path, entry.Name())
 		err := os.RemoveAll(entryPath)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("Failed removing %q: %w", entryPath, err)
 		}
 	}
@@ -293,7 +294,7 @@ func deleteParentSnapshotDirIfEmpty(poolName string, volType VolumeType, volName
 
 		if isEmpty {
 			err := os.Remove(snapshotsPath)
-			if err != nil && !os.IsNotExist(err) {
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return fmt.Errorf("Failed to remove '%s': %w", snapshotsPath, err)
 			}
 		}
@@ -331,7 +332,11 @@ func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64, allowUnsafe
 	}
 
 	// Get rounded block size to avoid QEMU boundary issues.
-	sizeBytes = vol.driver.roundVolumeBlockSizeBytes(sizeBytes)
+	var err error
+	sizeBytes, err = vol.driver.roundVolumeBlockSizeBytes(vol, sizeBytes)
+	if err != nil {
+		return false, err
+	}
 
 	if util.PathExists(path) {
 		fi, err := os.Stat(path)
@@ -375,7 +380,7 @@ func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64, allowUnsafe
 
 	// If path doesn't exist, then there has been no filler function supplied to create it from another source.
 	// So instead create an empty volume (use for PXE booting a VM).
-	err := ensureSparseFile(path, sizeBytes)
+	err = ensureSparseFile(path, sizeBytes)
 	if err != nil {
 		return false, fmt.Errorf("Failed creating disk image %q as size %d: %w", path, sizeBytes, err)
 	}
@@ -510,21 +515,20 @@ func growFileSystem(fsType string, devPath string, vol Volume) error {
 	}
 
 	return vol.MountTask(func(mountPath string, op *operations.Operation) error {
-		var msg string
 		var err error
 		switch fsType {
 		case "ext4":
-			msg, err = subprocess.TryRunCommand("resize2fs", devPath)
+			_, err = subprocess.TryRunCommand("resize2fs", devPath)
 		case "xfs":
-			msg, err = subprocess.TryRunCommand("xfs_growfs", mountPath)
+			_, err = subprocess.TryRunCommand("xfs_growfs", mountPath)
 		case "btrfs":
-			msg, err = subprocess.TryRunCommand("btrfs", "filesystem", "resize", "max", mountPath)
+			_, err = subprocess.TryRunCommand("btrfs", "filesystem", "resize", "max", mountPath)
 		default:
 			return fmt.Errorf("Unrecognised filesystem type %q", fsType)
 		}
 
 		if err != nil {
-			return fmt.Errorf("Could not grow underlying %q filesystem for %q: %s", fsType, devPath, msg)
+			return fmt.Errorf("Could not grow underlying %q filesystem for %q: %w", fsType, devPath, err)
 		}
 
 		return nil
@@ -936,4 +940,20 @@ func sliceAny[T any](slice []T, predicate func(T) bool) bool {
 	}
 
 	return false
+}
+
+// roundAbove returns the next multiple of `above` greater than `val`.
+func roundAbove(above, val int64) int64 {
+	if val < above {
+		val = above
+	}
+
+	rounded := int64(val/above) * above
+
+	// Ensure the rounded size is at least x.
+	if rounded < val {
+		rounded += above
+	}
+
+	return rounded
 }

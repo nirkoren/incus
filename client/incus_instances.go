@@ -626,6 +626,9 @@ func (r *ProtocolIncus) tryCreateInstance(req api.InstancesPost, urls []string, 
 	operation := req.Source.Operation
 
 	// Forward targetOp to remote op
+	chConnect := make(chan error, 1)
+	chWait := make(chan error, 1)
+
 	go func() {
 		success := false
 		var errors []remoteOperationResult
@@ -665,13 +668,35 @@ func (r *ProtocolIncus) tryCreateInstance(req api.InstancesPost, urls []string, 
 			break
 		}
 
-		if !success {
-			rop.err = remoteOperationError("Failed instance creation", errors)
+		if success {
+			chConnect <- nil
+			close(chConnect)
+		} else {
+			chConnect <- remoteOperationError("Failed instance creation", errors)
+			close(chConnect)
+
 			if op != nil {
 				_ = op.Cancel()
 			}
 		}
+	}()
 
+	if op != nil {
+		go func() {
+			chWait <- op.Wait()
+			close(chWait)
+		}()
+	}
+
+	go func() {
+		var err error
+
+		select {
+		case err = <-chConnect:
+		case err = <-chWait:
+		}
+
+		rop.err = err
 		close(rop.chDone)
 	}()
 
@@ -863,7 +888,7 @@ func (r *ProtocolIncus) CopyInstance(source InstanceServer, instance api.Instanc
 		target.Certificate = info.Certificate
 		sourceReq.Target = &target
 
-		return r.tryMigrateInstance(source, instance.Name, sourceReq, info.Addresses)
+		return r.tryMigrateInstance(source, instance.Name, sourceReq, info.Addresses, op)
 	}
 
 	// Get source server connection information
@@ -974,7 +999,7 @@ func (r *ProtocolIncus) RenameInstance(name string, instance api.InstancePost) (
 
 // tryMigrateInstance attempts to migrate a specific instance from a source server to one of the target URLs.
 // The function runs the migration operation asynchronously and returns a RemoteOperation to track the progress and handle any errors.
-func (r *ProtocolIncus) tryMigrateInstance(source InstanceServer, name string, req api.InstancePost, urls []string) (RemoteOperation, error) {
+func (r *ProtocolIncus) tryMigrateInstance(source InstanceServer, name string, req api.InstancePost, urls []string, op Operation) (RemoteOperation, error) {
 	if len(urls) == 0 {
 		return nil, fmt.Errorf("The target server isn't listening on the network")
 	}
@@ -986,6 +1011,9 @@ func (r *ProtocolIncus) tryMigrateInstance(source InstanceServer, name string, r
 	operation := req.Target.Operation
 
 	// Forward targetOp to remote op
+	chConnect := make(chan error, 1)
+	chWait := make(chan error, 1)
+
 	go func() {
 		success := false
 		var errors []remoteOperationResult
@@ -1019,10 +1047,35 @@ func (r *ProtocolIncus) tryMigrateInstance(source InstanceServer, name string, r
 			break
 		}
 
-		if !success {
-			rop.err = remoteOperationError("Failed instance migration", errors)
+		if success {
+			chConnect <- nil
+			close(chConnect)
+		} else {
+			chConnect <- remoteOperationError("Failed instance migration", errors)
+			close(chConnect)
+
+			if op != nil {
+				_ = op.Cancel()
+			}
+		}
+	}()
+
+	if op != nil {
+		go func() {
+			chWait <- op.Wait()
+			close(chWait)
+		}()
+	}
+
+	go func() {
+		var err error
+
+		select {
+		case err = <-chConnect:
+		case err = <-chWait:
 		}
 
+		rop.err = err
 		close(rop.chDone)
 	}()
 
@@ -1470,6 +1523,15 @@ func (r *ProtocolIncus) CreateInstanceFile(instanceName string, filePath string,
 	req, err := http.NewRequest("POST", requestURL, args.Content)
 	if err != nil {
 		return err
+	}
+
+	req.GetBody = func() (io.ReadCloser, error) {
+		_, err := args.Content.Seek(0, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		return io.NopCloser(args.Content), nil
 	}
 
 	// Set the various headers
@@ -2401,6 +2463,15 @@ func (r *ProtocolIncus) CreateInstanceTemplateFile(instanceName string, template
 	req, err := http.NewRequest("POST", url, content)
 	if err != nil {
 		return err
+	}
+
+	req.GetBody = func() (io.ReadCloser, error) {
+		_, err := content.Seek(0, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		return io.NopCloser(content), nil
 	}
 
 	req.Header.Set("Content-Type", "application/octet-stream")

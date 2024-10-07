@@ -21,6 +21,33 @@ import (
 	"github.com/lxc/incus/v6/shared/util"
 )
 
+// HiddenStoragePools returns a list of storage pools that should be hidden from users of the project.
+func HiddenStoragePools(ctx context.Context, tx *db.ClusterTx, projectName string) ([]string, error) {
+	dbProject, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+	if err != nil {
+		return nil, fmt.Errorf("Failed getting project: %w", err)
+	}
+
+	project, err := dbProject.ToAPI(ctx, tx.Tx())
+	if err != nil {
+		return nil, err
+	}
+
+	hiddenPools := []string{}
+	for k, v := range project.Config {
+		if !strings.HasPrefix(k, projectLimitDiskPool) || v != "0" {
+			continue
+		}
+
+		fields := strings.SplitN(k, projectLimitDiskPool, 2)
+		if len(fields) == 2 {
+			hiddenPools = append(hiddenPools, fields[1])
+		}
+	}
+
+	return hiddenPools, nil
+}
+
 // AllowInstanceCreation returns an error if any project-specific limit or
 // restriction is violated when creating a new instance.
 func AllowInstanceCreation(tx *db.ClusterTx, projectName string, req api.InstancesPost) error {
@@ -226,7 +253,7 @@ func checkRestrictionsOnVolatileConfig(project api.Project, instanceType instanc
 
 // AllowVolumeCreation returns an error if any project-specific limit or
 // restriction is violated when creating a new custom volume in a project.
-func AllowVolumeCreation(tx *db.ClusterTx, projectName string, req api.StorageVolumesPost) error {
+func AllowVolumeCreation(tx *db.ClusterTx, projectName string, poolName string, req api.StorageVolumesPost) error {
 	info, err := fetchProject(tx, projectName, true)
 	if err != nil {
 		return err
@@ -243,8 +270,9 @@ func AllowVolumeCreation(tx *db.ClusterTx, projectName string, req api.StorageVo
 
 	// Add the volume being created.
 	info.Volumes = append(info.Volumes, db.StorageVolumeArgs{
-		Name:   req.Name,
-		Config: req.Config,
+		Name:     req.Name,
+		Config:   req.Config,
+		PoolName: poolName,
 	})
 
 	err = checkRestrictionsAndAggregateLimits(tx, info)
@@ -311,8 +339,9 @@ func checkRestrictionsAndAggregateLimits(tx *db.ClusterTx, info *projectInfo) er
 	// across all project instances.
 	aggregateKeys := []string{}
 	isRestricted := false
+
 	for key, value := range info.Project.Config {
-		if slices.Contains(allAggregateLimits, key) {
+		if slices.Contains(allAggregateLimits, key) || strings.HasPrefix(key, projectLimitDiskPool) {
 			aggregateKeys = append(aggregateKeys, key)
 			continue
 		}
@@ -365,7 +394,14 @@ func getAggregateLimits(info *projectInfo, aggregateKeys []string) (map[string]a
 		max := int64(-1)
 		limit := info.Project.Config[key]
 		if limit != "" {
-			parser := aggregateLimitConfigValueParsers[key]
+			keyName := key
+
+			// Handle pool-specific limits.
+			if strings.HasPrefix(key, projectLimitDiskPool) {
+				keyName = "limits.disk"
+			}
+
+			parser := aggregateLimitConfigValueParsers[keyName]
 			max, err = parser(info.Project.Config[key])
 			if err != nil {
 				return nil, err
@@ -394,7 +430,14 @@ func checkAggregateLimits(info *projectInfo, aggregateKeys []string) error {
 	}
 
 	for _, key := range aggregateKeys {
-		parser := aggregateLimitConfigValueParsers[key]
+		keyName := key
+
+		// Handle pool-specific limits.
+		if strings.HasPrefix(key, projectLimitDiskPool) {
+			keyName = "limits.disk"
+		}
+
+		parser := aggregateLimitConfigValueParsers[keyName]
 		max, err := parser(info.Project.Config[key])
 		if err != nil {
 			return err
@@ -404,6 +447,7 @@ func checkAggregateLimits(info *projectInfo, aggregateKeys []string) error {
 			return fmt.Errorf("Reached maximum aggregate value %q for %q in project %q", info.Project.Config[key], key, info.Project.Name)
 		}
 	}
+
 	return nil
 }
 
@@ -858,8 +902,14 @@ func isVMLowLevelOptionForbidden(key string) bool {
 		"boot.host_shutdown_action",
 		"boot.host_shutdown_timeout",
 		"limits.memory.hugepages",
+		"raw.apparmor",
 		"raw.idmap",
 		"raw.qemu",
+		"raw.qemu.conf",
+		"raw.qemu.qmp.early",
+		"raw.qemu.qmp.post-start",
+		"raw.qemu.qmp.pre-start",
+		"raw.qemu.scriptlet",
 	},
 		key)
 }
@@ -1115,7 +1165,14 @@ func validateAggregateLimit(totals map[string]int64, key, value string) error {
 		return nil
 	}
 
-	parser := aggregateLimitConfigValueParsers[key]
+	keyName := key
+
+	// Handle pool-specific limits.
+	if strings.HasPrefix(key, projectLimitDiskPool) {
+		keyName = "limits.disk"
+	}
+
+	parser := aggregateLimitConfigValueParsers[keyName]
 	limit, err := parser(value)
 	if err != nil {
 		return fmt.Errorf("Invalid value %q for limit %q: %w", value, key, err)
@@ -1123,7 +1180,14 @@ func validateAggregateLimit(totals map[string]int64, key, value string) error {
 
 	total := totals[key]
 	if limit < total {
-		printer := aggregateLimitConfigValuePrinters[key]
+		keyName := key
+
+		// Handle pool-specific limits.
+		if strings.HasPrefix(key, projectLimitDiskPool) {
+			keyName = "limits.disk"
+		}
+
+		printer := aggregateLimitConfigValuePrinters[keyName]
 		return fmt.Errorf("%q is too low: current total is %q", key, printer(total))
 	}
 
@@ -1193,9 +1257,14 @@ func fetchProject(tx *db.ClusterTx, projectName string, skipIfNoLimits bool) (*p
 		return nil, fmt.Errorf("Fetch profiles from database: %w", err)
 	}
 
+	dbProfileDevices, err := cluster.GetDevices(ctx, tx.Tx(), "profile")
+	if err != nil {
+		return nil, fmt.Errorf("Fetch profile devices from database: %w", err)
+	}
+
 	profiles := make([]api.Profile, 0, len(dbProfiles))
 	for _, profile := range dbProfiles {
-		apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+		apiProfile, err := profile.ToAPI(ctx, tx.Tx(), dbProfileDevices)
 		if err != nil {
 			return nil, err
 		}
@@ -1208,9 +1277,14 @@ func fetchProject(tx *db.ClusterTx, projectName string, skipIfNoLimits bool) (*p
 		return nil, fmt.Errorf("Fetch project instances from database: %w", err)
 	}
 
+	dbInstanceDevices, err := cluster.GetDevices(ctx, tx.Tx(), "instance")
+	if err != nil {
+		return nil, fmt.Errorf("Fetch instance devices from database: %w", err)
+	}
+
 	instances := make([]api.Instance, 0, len(dbInstances))
 	for _, instance := range dbInstances {
-		apiInstance, err := instance.ToAPI(ctx, tx.Tx())
+		apiInstance, err := instance.ToAPI(ctx, tx.Tx(), dbInstanceDevices, dbProfileDevices)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to get API data for instance %q in project %q: %w", instance.Name, instance.Project, err)
 		}
@@ -1267,8 +1341,18 @@ func getTotalsAcrossProjectEntities(info *projectInfo, keys []string, skipUnset 
 
 	for _, key := range keys {
 		totals[key] = 0
-		if key == "limits.disk" {
+		if key == "limits.disk" || strings.HasPrefix(key, projectLimitDiskPool) {
+			poolName := ""
+			fields := strings.SplitN(key, projectLimitDiskPool, 2)
+			if len(fields) == 2 {
+				poolName = fields[1]
+			}
+
 			for _, volume := range info.Volumes {
+				if poolName != "" && volume.PoolName != poolName {
+					continue
+				}
+
 				value, ok := volume.Config["size"]
 				if !ok {
 					if skipUnset {
@@ -1309,12 +1393,29 @@ func getInstanceLimits(inst api.Instance, keys []string, skipUnset bool) (map[st
 
 	for _, key := range keys {
 		var limit int64
-		parser := aggregateLimitConfigValueParsers[key]
+		keyName := key
 
-		if key == "limits.disk" {
+		// Handle pool-specific limits.
+		if strings.HasPrefix(key, projectLimitDiskPool) {
+			keyName = "limits.disk"
+		}
+
+		parser := aggregateLimitConfigValueParsers[keyName]
+
+		if key == "limits.disk" || strings.HasPrefix(key, projectLimitDiskPool) {
+			poolName := ""
+			fields := strings.SplitN(key, projectLimitDiskPool, 2)
+			if len(fields) == 2 {
+				poolName = fields[1]
+			}
+
 			_, device, err := instance.GetRootDiskDevice(inst.Devices)
 			if err != nil {
 				return nil, fmt.Errorf("Failed getting root disk device for instance %q in project %q: %w", inst.Name, inst.Project, err)
+			}
+
+			if poolName != "" && device["pool"] != poolName {
+				continue
 			}
 
 			value, ok := device["size"]

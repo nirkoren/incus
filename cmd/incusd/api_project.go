@@ -862,7 +862,7 @@ func projectPost(d *Daemon, r *http.Request) response.Response {
 
 		err = s.Authorizer.RenameProject(s.ShutdownCtx, id, name, req.Name)
 		if err != nil {
-			return err
+			logger.Error("Failed to rename project in authorizer", logger.Ctx{"name": name, "new_name": req.Name, "err": err})
 		}
 
 		requestor := request.CreateRequestor(r)
@@ -1094,6 +1094,12 @@ func projectDelete(d *Daemon, r *http.Request) response.Response {
 			count--
 		}
 
+		// Empty the default profile.
+		err = target.UpdateProfile("default", api.ProfilePut{}, "")
+		if err != nil {
+			return response.InternalError(err)
+		}
+
 		// Delete images.
 		for _, imageFingerprint := range entries["images"] {
 			op, err := target.DeleteImage(imageFingerprint)
@@ -1190,7 +1196,7 @@ func projectDelete(d *Daemon, r *http.Request) response.Response {
 
 	err = s.Authorizer.DeleteProject(r.Context(), id, name)
 	if err != nil {
-		return response.SmartError(err)
+		logger.Error("Failed to remove project from authorizer", logger.Ctx{"name": name, "err": err})
 	}
 
 	requestor := request.CreateRequestor(r)
@@ -1469,7 +1475,40 @@ func projectValidateConfig(s *state.State, config map[string]string) error {
 		// ---
 		//  type: string
 		//  shortdesc: Cluster groups that can be targeted
-		"restricted.cluster.groups": validate.Optional(validate.IsListOf(validate.IsAny)),
+		"restricted.cluster.groups": validate.Optional(func(value string) error {
+			// Basic format validation.
+			err := validate.IsListOf(validate.IsAny)(value)
+			if err != nil {
+				return err
+			}
+
+			// Get all valid groups.
+			groupNames := []string{}
+			err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+				clusterGroups, err := cluster.GetClusterGroups(ctx, tx.Tx())
+				if err != nil {
+					return err
+				}
+
+				for _, group := range clusterGroups {
+					groupNames = append(groupNames, group.Name)
+				}
+
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+
+			// Confirm that the group names exist.
+			for _, name := range util.SplitNTrimSpace(value, ",", -1, true) {
+				if !slices.Contains(groupNames, name) {
+					return fmt.Errorf("Cluster group %q doesn't exist", name)
+				}
+			}
+
+			return nil
+		}),
 
 		// gendoc:generate(entity=project, group=restricted, key=restricted.cluster.target)
 		// Possible values are `allow` or `block`.
@@ -1690,6 +1729,34 @@ func projectValidateConfig(s *state.State, config map[string]string) error {
 		//  defaultdesc: `block`
 		//  shortdesc: Whether to prevent creating instance or volume snapshots
 		"restricted.snapshots": isEitherAllowOrBlock,
+	}
+
+	// Add the storage pool keys.
+	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		// Load all the pools.
+		pools, err := tx.GetStoragePoolNames(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Add the storage-pool specific config keys.
+		for _, poolName := range pools {
+			// gendoc:generate(entity=project, group=limits, key=limits.disk.pool.POOL_NAME)
+			// This value is the maximum value of the aggregate disk
+			// space used by all instance volumes, custom volumes, and images of the
+			// project on this specific storage pool.
+			// ---
+			//  type: string
+			//  shortdesc: Maximum disk space used by the project on this pool
+			projectConfigKeys[fmt.Sprintf("limits.disk.pool.%s", poolName)] = validate.Optional(validate.IsSize)
+		}
+
+		return nil
+	})
+	if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
+		return fmt.Errorf("Failed loading storage pool names: %w", err)
 	}
 
 	for k, v := range config {

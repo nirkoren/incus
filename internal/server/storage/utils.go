@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -616,7 +618,7 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 
 	// Validate the target.
 	fileInfo, err := os.Stat(destBlockFile)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return -1, err
 	}
 
@@ -627,14 +629,14 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 
 	// convertBlockImage converts the qcow2 block image file into a raw block device. If needed it will attempt
 	// to enlarge the destination volume to accommodate the unpacked qcow2 image file.
-	convertBlockImage := func(v drivers.Volume, imgPath string, dstPath string) (int64, error) {
+	convertBlockImage := func(v drivers.Volume, imgPath string, dstPath string, tracker *ioprogress.ProgressTracker) (int64, error) {
 		// Get info about qcow2 file. Force input format to qcow2 so we don't rely on qemu-img's detection
 		// logic as that has been known to have vulnerabilities and we only support qcow2 images anyway.
 		// Use prlimit because qemu-img can consume considerable RAM & CPU time if fed a maliciously
 		// crafted disk image. Since cloud tenants are not to be trusted, ensure QEMU is limits to 1 GiB
 		// address space and 2 seconds CPU time, which ought to be more than enough for real world images.
 		cmd := []string{"prlimit", "--cpu=2", "--as=1073741824", "qemu-img", "info", "-f", "qcow2", "--output=json", imgPath}
-		imgJSON, err := apparmor.QemuImg(sysOS, cmd, imgPath, dstPath)
+		imgJSON, err := apparmor.QemuImg(sysOS, cmd, imgPath, dstPath, tracker)
 		if err != nil {
 			return -1, fmt.Errorf("Failed reading image info %q: %w", imgPath, err)
 		}
@@ -690,7 +692,7 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 
 		cmd = []string{
 			"nice", "-n19", // Run with low priority to reduce CPU impact on other processes.
-			"qemu-img", "convert", "-f", "qcow2", "-O", "raw",
+			"qemu-img", "convert", "-p", "-f", "qcow2", "-O", "raw", "-t", "writeback",
 		}
 
 		// Check for Direct I/O support.
@@ -713,8 +715,7 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 
 		cmd = append(cmd, imgPath, dstPath)
 
-		_, err = apparmor.QemuImg(sysOS, cmd, imgPath, dstPath)
-
+		_, err = apparmor.QemuImg(sysOS, cmd, imgPath, dstPath, tracker)
 		if err != nil {
 			return -1, fmt.Errorf("Failed converting image to raw at %q: %w", dstPath, err)
 		}
@@ -732,7 +733,7 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 		}
 
 		// Convert the qcow2 format to a raw block device.
-		imgSize, err = convertBlockImage(vol, imageRootfsFile, destBlockFile)
+		imgSize, err = convertBlockImage(vol, imageRootfsFile, destBlockFile, tracker)
 		if err != nil {
 			return -1, err
 		}
@@ -754,7 +755,7 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 		imgPath := filepath.Join(tempDir, "rootfs.img")
 
 		// Convert the qcow2 format to a raw block device.
-		imgSize, err = convertBlockImage(vol, imgPath, destBlockFile)
+		imgSize, err = convertBlockImage(vol, imgPath, destBlockFile, tracker)
 		if err != nil {
 			return -1, err
 		}
@@ -820,8 +821,14 @@ func VolumeUsedByProfileDevices(s *state.State, poolName string, projectName str
 			return fmt.Errorf("Failed loading profiles: %w", err)
 		}
 
+		// Get all the profile devices.
+		profileDevices, err := cluster.GetDevices(ctx, tx.Tx(), "profile")
+		if err != nil {
+			return fmt.Errorf("Failed loading profiles: %w", err)
+		}
+
 		for _, profile := range dbProfiles {
-			apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+			apiProfile, err := profile.ToAPI(ctx, tx.Tx(), profileDevices)
 			if err != nil {
 				return fmt.Errorf("Failed getting API Profile %q: %w", profile.Name, err)
 			}
@@ -869,7 +876,7 @@ func VolumeUsedByProfileDevices(s *state.State, poolName string, projectName str
 				continue
 			}
 
-			if dev["source"] == vol.Name {
+			if strings.Split(dev["source"], "/")[0] == vol.Name {
 				usedByDevices = append(usedByDevices, name)
 			}
 		}
@@ -938,7 +945,7 @@ func VolumeUsedByInstanceDevices(s *state.State, poolName string, projectName st
 					continue
 				}
 
-				if dev["source"] == vol.Name {
+				if strings.Split(dev["source"], "/")[0] == vol.Name {
 					usedByDevices = append(usedByDevices, devName)
 				}
 			}
@@ -965,8 +972,10 @@ func VolumeUsedByExclusiveRemoteInstancesWithProfiles(s *state.State, poolName s
 
 	info := pool.Driver().Info()
 
-	// Always return nil if the storage driver supports mounting volumes on multiple nodes at once.
-	if info.VolumeMultiNode {
+	// Always return nil if the storage driver supports mounting volumes
+	// on multiple nodes at once and we're not dealing with a filesystem volume
+	// on top of a block device.
+	if info.VolumeMultiNode && !(info.BlockBacking && vol.ContentType == "filesystem") {
 		return nil, nil
 	}
 

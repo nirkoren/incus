@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/internal/revert"
@@ -90,6 +91,7 @@ var api10 = []APIEndpoint{
 	networkIntegrationCmd,
 	networkIntegrationsCmd,
 	networkLoadBalancerCmd,
+	networkLoadBalancerStateCmd,
 	networkLoadBalancersCmd,
 	networkPeerCmd,
 	networkPeersCmd,
@@ -214,21 +216,35 @@ var api10 = []APIEndpoint{
 func api10Get(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
+	// Pull the full server config.
+	fullSrvConfig, err := daemonConfigRender(s)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
 	// Get the authentication methods.
 	authMethods := []string{api.AuthenticationMethodTLS}
 
-	oidcIssuer, oidcClientID, _, _ := s.GlobalConfig.OIDCServer()
+	oidcIssuer, oidcClientID, _, _, _ := s.GlobalConfig.OIDCServer()
 	if oidcIssuer != "" && oidcClientID != "" {
 		authMethods = append(authMethods, api.AuthenticationMethodOIDC)
 	}
 
 	srv := api.ServerUntrusted{
-		APIExtensions: version.APIExtensions,
+		APIExtensions: version.APIExtensions[:d.apiExtensions],
 		APIStatus:     "stable",
 		APIVersion:    version.APIVersion,
 		Public:        false,
 		Auth:          "untrusted",
 		AuthMethods:   authMethods,
+	}
+
+	// Populate the untrusted config (user.ui.XYZ).
+	srv.Config = map[string]string{}
+	for k, v := range fullSrvConfig {
+		if strings.HasPrefix(k, "user.ui.") {
+			srv.Config[k] = v
+		}
 	}
 
 	// If untrusted, return now
@@ -237,7 +253,7 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// If not authorized, return now.
-	err := s.Authorizer.CheckPermission(r.Context(), r, auth.ObjectServer(), auth.EntitlementCanView)
+	err = s.Authorizer.CheckPermission(r.Context(), r, auth.ObjectServer(), auth.EntitlementCanView)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -379,10 +395,7 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 
 	err = s.Authorizer.CheckPermission(r.Context(), r, auth.ObjectServer(), auth.EntitlementCanEdit)
 	if err == nil {
-		fullSrv.Config, err = daemonConfigRender(s)
-		if err != nil {
-			return response.InternalError(err)
-		}
+		fullSrv.Config = fullSrvConfig
 	} else if !api.StatusErrorCheck(err, http.StatusForbidden) {
 		return response.SmartError(err)
 	}
@@ -789,6 +802,7 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	oidcChanged := false
 	openFGAChanged := false
 	ovnChanged := false
+	ovsChanged := false
 	syslogChanged := false
 
 	for key := range clusterChanged {
@@ -844,6 +858,9 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 
 		case "core.syslog_socket":
 			syslogChanged = true
+
+		case "network.ovs.connection":
+			ovsChanged = true
 		}
 	}
 
@@ -953,13 +970,13 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	}
 
 	if oidcChanged {
-		oidcIssuer, oidcClientID, oidcAudience, oidcClaim := clusterConfig.OIDCServer()
+		oidcIssuer, oidcClientID, oidcScope, oidcAudience, oidcClaim := clusterConfig.OIDCServer()
 
 		if oidcIssuer == "" || oidcClientID == "" {
 			d.oidcVerifier = nil
 		} else {
 			var err error
-			d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcAudience, oidcClaim)
+			d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcScope, oidcAudience, oidcClaim)
 			if err != nil {
 				return fmt.Errorf("Failed creating verifier: %w", err)
 			}
@@ -976,6 +993,13 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 
 	if ovnChanged {
 		err := d.setupOVN()
+		if err != nil {
+			return err
+		}
+	}
+
+	if ovsChanged {
+		err := d.setupOVS()
 		if err != nil {
 			return err
 		}

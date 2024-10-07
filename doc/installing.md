@@ -33,7 +33,11 @@ Packages are available for a number of Linux distributions, either in their main
 ````{tabs}
 
 ```{group-tab} Alpine
-Incus and all of its dependencies are available in Alpine Linux's community repository as `incus`.
+Incus and all of its dependencies are available in Alpine Linux's edge main and community repository as `incus`.
+
+Uncomment the edge main and community repositories in `/etc/apk/repositories` and run:
+
+    apk update
 
 Install Incus with:
 
@@ -58,6 +62,8 @@ Install Incus with:
 
     pacman -S incus
 
+See also [the Incus documentation page at Arch Linux](https://wiki.archlinux.org/title/Incus) for more details about the installation, configuration, use and troubleshooting.
+
 Please report packaging issues [here](https://gitlab.archlinux.org/archlinux/packaging/packages/incus).
 ```
 
@@ -71,6 +77,7 @@ There are three options currently available to Debian users.
 
     On such systems, just running `apt install incus` will get Incus installed.
     To run virtual machines, also run `apt install qemu-system`.
+    If migrating from LXD, also run `apt install incus-tools` to get the `lxd-to-incus` command.
 
 1. Native `incus` backported package
 
@@ -78,6 +85,7 @@ There are three options currently available to Debian users.
 
    On such systems, just running `apt install incus/bookworm-backports` will get Incus installed.
    To run virtual machines, also run `apt install qemu-system`.
+   If migrating from LXD, also run `apt install incus-tools` to get the `lxd-to-incus` command.
 
    ****NOTE:**** Users of backported packages should not file bugs in the Debian Bug Tracker, instead please reach out [through our forum](https://discuss.linuxcontainers.org) or directly to the Debian packager.
 
@@ -164,6 +172,26 @@ Finally, you can add users to the `incus-admin` group to provide non-root access
 For any NixOS specific issues, please [file an issue](https://github.com/NixOS/nixpkgs/issues/new/choose) in the package repository.
 ```
 
+```{group-tab} Rocky Linux
+RPM packages and their dependencies are not yet available from the Extra Packages for Enterprise Linux (EPEL) repository, but via the [`neil/incus`](https://copr.fedorainfracloud.org/coprs/neil/incus/) Community Project (COPR) repository for Rocky Linux 9.
+
+Ensure that the EPEL repository is installed for package dependencies and then install the COPR repository:
+
+    dnf -y install epel-release
+    dnf copr enable neil/incus
+
+Ensure that the `CodeReady Builder` (`CRB`) is available for other package dependencies:
+
+    dnf config-manager --enable crb
+
+Then install Incus and optionally, Incus tools:
+
+    dnf install incus incus-tools
+
+Note that this is not an official project of Incus nor Rocky Linux.
+Please report packaging issues [here](https://github.com/NeilHanlon/incus-rpm/issues).
+```
+
 ```{group-tab} Ubuntu
 There are two options currently available to Ubuntu users.
 
@@ -172,6 +200,7 @@ There are two options currently available to Ubuntu users.
     A native `incus` package is currently available in Ubuntu 24.04 LTS and later.
     On such systems, just running `apt install incus` will get Incus installed.
     To run virtual machines, also run `apt install qemu-system`.
+    If migrating from LXD, also run `apt install incus-tools` to get the `lxd-to-incus` command.
 
 1. Zabbly package repository
 
@@ -210,11 +239,27 @@ The builds for other operating systems include only the client, not the server.
 
 ```{group-tab} macOS
 
+**Homebrew**
+
 Incus publishes builds of the Incus client for macOS through [Homebrew](https://brew.sh/).
 
 To install the feature branch of Incus, run:
 
     brew install incus
+
+**Colima**
+
+Incus is supported as a runtime on [Colima](https://github.com/abiosoft/colima).
+
+Install Colima with:
+
+    brew install colima
+
+Start Colima with Incus as runtime with:
+
+    colima start --runtime incus
+
+For any Colima related issues, please [file an issue](https://github.com/abiosoft/colima/issues/new/choose) in the project repository.
 ```
 
 ```{group-tab} Windows
@@ -288,7 +333,10 @@ Also, due to a [`gettext` issue](https://github.com/gosexy/gettext/issues/1), yo
 Install the build and required runtime dependencies with:
 
     sudo apt update
-    sudo apt install acl attr autoconf automake dnsmasq-base git golang-go libacl1-dev libcap-dev liblxc1 liblxc-dev libsqlite3-dev libtool libudev-dev liblz4-dev libuv1-dev make pkg-config rsync squashfs-tools tar tcl xz-utils ebtables
+    sudo apt install acl attr autoconf automake dnsmasq-base git golang-go libacl1-dev libcap-dev liblxc1 lxc-dev libsqlite3-dev libtool libudev-dev liblz4-dev libuv1-dev make pkg-config rsync squashfs-tools tar tcl xz-utils ebtables
+
+****NOTE:**** The version of `golang-go` in your version of Debian or Ubuntu may not be sufficient to build Incus (see {ref}`requirements-go`).
+In such cases, you may need to install a newer Go version [from upstream](https://go.dev/doc/install).
 
 There are a few storage drivers for Incus besides the default `dir` driver.
 Installing these tools adds a bit to initramfs and may slow down your
@@ -315,21 +363,23 @@ You can get the development resources required to build Incus on your OpenSUSE T
 
     sudo zypper install autoconf automake git go libacl-devel libcap-devel liblxc1 liblxc-devel sqlite3-devel libtool libudev-devel liblz4-devel libuv-devel make pkg-config tcl
 
-In addition, for normal operation, you'll also likely need
+In addition, for normal operation, you'll also likely need:
 
     sudo zypper install dnsmasq squashfs xz rsync tar attr acl qemu qemu-img qemu-spice qemu-hw-display-virtio-gpu-pci iptables ebtables nftables
 
-As OpenSUSE stores QEMU firmware files using an unusual filename and location, you will need to create some symlinks for them:
+For using NVIDIA GPUs inside containers, you will need the NVIDIA container tools and LXC hooks:
 
-    sudo mkdir /usr/share/OVMF
-    sudo ln -s /usr/share/qemu/ovmf-x86_64-4m-code.bin /usr/share/OVMF/OVMF_CODE.4MB.fd
-    sudo ln -s /usr/share/qemu/ovmf-x86_64-4m-vars.bin /usr/share/OVMF/OVMF_VARS.4MB.fd
-    sudo ln -s /usr/share/qemu/ovmf-x86_64-ms-4m-vars.bin /usr/share/OVMF/OVMF_VARS.4MB.ms.fd
-    sudo ln -s /usr/share/qemu/ovmf-x86_64-ms-4m-code.bin /usr/share/OVMF/OVMF_CODE.4MB.ms.fd
+    sudo zypper install libnvidia-container-tools lxc
+
 ```
 
 
 ````
+
+```{note}
+On ARM64 CPUs you need to install AAVMF instead of OVMF for UEFI to work with virtual machines.
+In some distributions this is done through a separate package.
+```
 
 ### From source: Build the latest version
 
@@ -352,8 +402,8 @@ The Incus release tarballs bundle a complete dependency tree as well as a
 local copy of `libraft` and `libcowsql` for Incus' database setup.
 
 ```bash
-tar zxvf incus-0.1.tar.gz
-cd incus-0.1
+tar zxvf incus-6.0.0.tar.gz
+cd incus-6.0.0
 ```
 
 This will unpack the release tarball and place you inside of the source tree.

@@ -14,6 +14,13 @@ import (
 	"github.com/lxc/incus/v6/shared/api"
 )
 
+// ChardevChangeInfo contains information required to change the backend of a chardev.
+type ChardevChangeInfo struct {
+	Type   string   `json:"type"`
+	File   *os.File `json:"file,omitempty"`
+	FDName string   `json:"fdname,omitempty"`
+}
+
 // FdsetFdInfo contains information about a file descriptor that belongs to an FD set.
 type FdsetFdInfo struct {
 	FD     int    `json:"fd"`
@@ -61,6 +68,12 @@ type HotpluggableCPU struct {
 	Props CPUInstanceProperties `json:"props"`
 }
 
+// CPUModel contains information about a CPU model.
+type CPUModel struct {
+	Name  string         `json:"name"`
+	Flags map[string]any `json:"props"`
+}
+
 // QueryCPUs returns a list of CPUs.
 func (m *Monitor) QueryCPUs() ([]CPU, error) {
 	// Prepare the response.
@@ -89,6 +102,28 @@ func (m *Monitor) QueryHotpluggableCPUs() ([]HotpluggableCPU, error) {
 	}
 
 	return resp.Return, nil
+}
+
+// QueryCPUModel returns a CPUModel for the specified model name.
+func (m *Monitor) QueryCPUModel(model string) (*CPUModel, error) {
+	// Prepare the response.
+	var resp struct {
+		Return struct {
+			Model CPUModel `json:"model"`
+		} `json:"return"`
+	}
+
+	args := map[string]any{
+		"model": map[string]string{"name": model},
+		"type":  "full",
+	}
+
+	err := m.run("query-cpu-model-expansion", args, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to query CPU model: %w", err)
+	}
+
+	return &resp.Return.Model, nil
 }
 
 // Status returns the current VM status.
@@ -280,9 +315,28 @@ func (m *Monitor) MigrateSetCapabilities(caps map[string]bool) error {
 }
 
 // Migrate starts a migration stream.
-func (m *Monitor) Migrate(uri string) error {
+func (m *Monitor) Migrate(name string) error {
 	// Query the status.
-	args := map[string]string{"uri": uri}
+
+	type migrateArgsChannel struct {
+		ChannelType string            `json:"channel-type"`
+		Address     map[string]string `json:"addr"`
+	}
+
+	type migrateArgs struct {
+		Channels []migrateArgsChannel `json:"channels"`
+	}
+
+	args := migrateArgs{}
+	args.Channels = []migrateArgsChannel{{
+		ChannelType: "main",
+		Address: map[string]string{
+			"transport": "socket",
+			"type":      "fd",
+			"str":       name,
+		},
+	}}
+
 	err := m.run("migrate", args, nil)
 	if err != nil {
 		return err
@@ -338,9 +392,27 @@ func (m *Monitor) MigrateContinue(fromState string) error {
 }
 
 // MigrateIncoming starts the receiver of a migration stream.
-func (m *Monitor) MigrateIncoming(ctx context.Context, uri string) error {
+func (m *Monitor) MigrateIncoming(ctx context.Context, name string) error {
+	type migrateArgsChannel struct {
+		ChannelType string            `json:"channel-type"`
+		Address     map[string]string `json:"addr"`
+	}
+
+	type migrateArgs struct {
+		Channels []migrateArgsChannel `json:"channels"`
+	}
+
+	args := migrateArgs{}
+	args.Channels = []migrateArgsChannel{{
+		ChannelType: "main",
+		Address: map[string]string{
+			"transport": "socket",
+			"type":      "fd",
+			"str":       name,
+		},
+	}}
+
 	// Query the status.
-	args := map[string]string{"uri": uri}
 	err := m.run("migrate-incoming", args, nil)
 	if err != nil {
 		return err
@@ -1015,6 +1087,24 @@ func (m *Monitor) Eject(id string) error {
 	return nil
 }
 
+// UpdateBlockSize updates the size of a disk.
+func (m *Monitor) UpdateBlockSize(id string) error {
+	var args struct {
+		NodeName string `json:"node-name"`
+		Size     int64  `json:"size"`
+	}
+
+	args.NodeName = id
+	args.Size = 1
+
+	err := m.run("block_resize", args, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // SetBlockThrottle applies an I/O limit on a disk.
 func (m *Monitor) SetBlockThrottle(id string, bytesRead int, bytesWrite int, iopsRead int, iopsWrite int) error {
 	var args struct {
@@ -1040,4 +1130,147 @@ func (m *Monitor) SetBlockThrottle(id string, bytesRead int, bytesWrite int, iop
 	}
 
 	return nil
+}
+
+// CheckPCIDevice checks if the deviceID exists as a bridged PCI device.
+func (m *Monitor) CheckPCIDevice(deviceID string) (bool, error) {
+	pciDevs, err := m.QueryPCI()
+	if err != nil {
+		return false, err
+	}
+
+	for _, pciDev := range pciDevs {
+		for _, bridgeDev := range pciDev.Bridge.Devices {
+			if bridgeDev.DevID == deviceID {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+// RingbufRead returns the complete contents of the specified ring buffer.
+func (m *Monitor) RingbufRead(device string) (string, error) {
+	// Begin by ensuring the device specified is actually a ring buffer.
+	var queryResp struct {
+		Return []struct {
+			Label        string `json:"label"`
+			Filename     string `json:"filename"`
+			FrontendOpen bool   `json:"frontend_open"`
+		} `json:"return"`
+	}
+
+	err := m.run("query-chardev", nil, &queryResp)
+	if err != nil {
+		return "", err
+	}
+
+	deviceFound := true
+	for _, qemuDevice := range queryResp.Return {
+		if qemuDevice.Label == device {
+			deviceFound = true
+			if qemuDevice.Filename != "ringbuf" {
+				// Can't call `ringbuf-read` on a non-ringbuf device.
+				return "", ErrNotARingbuf
+			}
+
+			break
+		}
+	}
+	if !deviceFound {
+		return "", fmt.Errorf("Specified qemu device %q doesn't exist", device)
+	}
+
+	// Now actually read from the ring buffer.
+	var args struct {
+		Device string `json:"device"`
+		Size   int    `json:"size"`
+	}
+
+	args.Device = device
+	args.Size = 10000
+
+	var readResp struct {
+		Return string `json:"return"`
+	}
+
+	var sb strings.Builder
+
+	for {
+		err := m.run("ringbuf-read", args, &readResp)
+		if err != nil {
+			return "", err
+		}
+
+		if len(readResp.Return) == 0 {
+			break
+		}
+
+		sb.WriteString(readResp.Return)
+	}
+
+	return sb.String(), nil
+}
+
+// ChardevChange changes the backend of a specified chardev. Currently supports the socket and ringbuf backends.
+func (m *Monitor) ChardevChange(device string, info ChardevChangeInfo) error {
+	if info.Type == "socket" {
+		// Share the existing file descriptor with qemu.
+		err := m.SendFile(info.FDName, info.File)
+		if err != nil {
+			return err
+		}
+
+		var args struct {
+			ID      string `json:"id"`
+			Backend struct {
+				Type string `json:"type"`
+				Data struct {
+					Addr struct {
+						Type string `json:"type"`
+						Data struct {
+							Str string `json:"str"`
+						} `json:"data"`
+					} `json:"addr"`
+					Server bool `json:"server"`
+					Wait   bool `json:"wait"`
+				} `json:"data"`
+			} `json:"backend"`
+		}
+
+		args.ID = device
+		args.Backend.Type = info.Type
+		args.Backend.Data.Addr.Type = "fd"
+		args.Backend.Data.Addr.Data.Str = info.FDName
+		args.Backend.Data.Server = true
+		args.Backend.Data.Wait = false
+
+		err = m.run("chardev-change", args, nil)
+		if err != nil {
+			// If the chardev-change command failed for some reason, ensure qemu cleans up its file descriptor.
+			_ = m.CloseFile(info.FDName)
+			return err
+		}
+
+		return nil
+	} else if info.Type == "ringbuf" {
+		var args struct {
+			ID      string `json:"id"`
+			Backend struct {
+				Type string `json:"type"`
+				Data struct {
+					Size int `json:"size"`
+				} `json:"data"`
+			} `json:"backend"`
+		}
+
+		args.ID = device
+		args.Backend.Type = info.Type
+		args.Backend.Data.Size = 1048576
+
+		return m.run("chardev-change", args, nil)
+	}
+
+	return fmt.Errorf("Unsupported chardev type %q", info.Type)
 }

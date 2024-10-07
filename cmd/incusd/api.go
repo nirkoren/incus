@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 
@@ -164,6 +167,7 @@ func restServer(d *Daemon) *http.Server {
 	return &http.Server{
 		Handler:     &httpServer{r: mux, d: d},
 		ConnContext: request.SaveConnectionInContext,
+		IdleTimeout: 30 * time.Second,
 	}
 }
 
@@ -364,7 +368,10 @@ type httpServer struct {
 
 func (s *httpServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if !strings.HasPrefix(req.URL.Path, "/internal") {
-		<-s.d.setupChan
+		// Wait for startup if not cluster internal queries.
+		if !isClusterNotification(req) {
+			<-s.d.setupChan
+		}
 
 		// Set CORS headers, unless this is an internal request.
 		setCORSHeaders(rw, req, s.d.State().GlobalConfig)
@@ -380,6 +387,11 @@ func (s *httpServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 func setCORSHeaders(rw http.ResponseWriter, req *http.Request, config *clusterConfig.Config) {
+	// Check if we have a working config.
+	if config == nil {
+		return
+	}
+
 	allowedOrigin := config.HTTPSAllowedOrigin()
 	origin := req.Header.Get("Origin")
 	if allowedOrigin != "" && origin != "" {
@@ -413,10 +425,11 @@ type uiHttpDir struct {
 	http.FileSystem
 }
 
-func (fs uiHttpDir) Open(name string) (http.File, error) {
-	fsFile, err := fs.FileSystem.Open(name)
-	if err != nil && os.IsNotExist(err) {
-		return fs.FileSystem.Open("index.html")
+// Open is part of the http.FileSystem interface.
+func (httpFS uiHttpDir) Open(name string) (http.File, error) {
+	fsFile, err := httpFS.FileSystem.Open(name)
+	if err != nil && errors.Is(err, fs.ErrNotExist) {
+		return httpFS.FileSystem.Open("index.html")
 	}
 
 	return fsFile, err
@@ -426,10 +439,11 @@ type documentationHttpDir struct {
 	http.FileSystem
 }
 
-func (fs documentationHttpDir) Open(name string) (http.File, error) {
-	fsFile, err := fs.FileSystem.Open(name)
-	if err != nil && os.IsNotExist(err) {
-		return fs.FileSystem.Open("index.html")
+// Open is part of the http.FileSystem interface.
+func (httpFS documentationHttpDir) Open(name string) (http.File, error) {
+	fsFile, err := httpFS.FileSystem.Open(name)
+	if err != nil && errors.Is(err, fs.ErrNotExist) {
+		return httpFS.FileSystem.Open("index.html")
 	}
 
 	return fsFile, err

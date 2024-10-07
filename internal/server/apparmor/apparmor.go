@@ -2,8 +2,10 @@ package apparmor
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +23,48 @@ const (
 	cmdParse  = "Q"
 )
 
+var aaCacheDir string
 var aaPath = internalUtil.VarPath("security", "apparmor")
+var aaVersion *version.DottedVersion
+
+// Init performs initial version and feature detection.
+func Init() error {
+	// Fill in aaVersion.
+	out, err := subprocess.RunCommand("apparmor_parser", "--version")
+	if err != nil {
+		return err
+	}
+
+	fields := strings.Fields(strings.Split(out, "\n")[0])
+	parsedVersion, err := version.Parse(fields[len(fields)-1])
+	if err != nil {
+		return err
+	}
+
+	aaVersion = parsedVersion
+
+	// Fill in aaCacheDir.
+	basePath := filepath.Join(aaPath, "cache")
+
+	// Multiple policy cache directories were only added in v2.13.
+	minVer, err := version.NewDottedVersion("2.13")
+	if err != nil {
+		return err
+	}
+
+	if aaVersion.Compare(minVer) < 0 {
+		aaCacheDir = basePath
+	} else {
+		output, err := subprocess.RunCommand("apparmor_parser", "-L", basePath, "--print-cache-dir")
+		if err != nil {
+			return err
+		}
+
+		aaCacheDir = strings.TrimSpace(output)
+	}
+
+	return nil
+}
 
 // runApparmor runs the relevant AppArmor command.
 func runApparmor(sysOS *sys.OS, command string, name string) error {
@@ -73,7 +116,7 @@ func deleteNamespace(sysOS *sys.OS, name string) error {
 
 	p := filepath.Join("/sys/kernel/security/apparmor/policy/namespaces", name)
 	err := os.Remove(p)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 
@@ -140,27 +183,26 @@ func unloadProfile(sysOS *sys.OS, fullName string, name string) error {
 
 // deleteProfile unloads and delete profile and cache for a profile.
 func deleteProfile(sysOS *sys.OS, fullName string, name string) error {
-	if !sysOS.AppArmorAdmin {
+	if !sysOS.AppArmorAvailable || !sysOS.AppArmorAdmin {
 		return nil
 	}
 
-	cacheDir, err := getCacheDir(sysOS)
+	if aaCacheDir == "" {
+		return fmt.Errorf("Couldn't identify AppArmor cache directory")
+	}
+
+	err := unloadProfile(sysOS, fullName, name)
 	if err != nil {
 		return err
 	}
 
-	err = unloadProfile(sysOS, fullName, name)
-	if err != nil {
-		return err
-	}
-
-	err = os.Remove(filepath.Join(cacheDir, name))
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("Failed to remove %s: %w", filepath.Join(cacheDir, name), err)
+	err = os.Remove(filepath.Join(aaCacheDir, name))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("Failed to remove %s: %w", filepath.Join(aaCacheDir, name), err)
 	}
 
 	err = os.Remove(filepath.Join(aaPath, "profiles", name))
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("Failed to remove %s: %w", filepath.Join(aaPath, "profiles", name), err)
 	}
 
@@ -173,9 +215,8 @@ func parserSupports(sysOS *sys.OS, feature string) (bool, error) {
 		return false, nil
 	}
 
-	ver, err := getVersion(sysOS)
-	if err != nil {
-		return false, err
+	if aaVersion == nil {
+		return false, fmt.Errorf("Couldn't identify AppArmor version")
 	}
 
 	if feature == "unix" {
@@ -184,65 +225,10 @@ func parserSupports(sysOS *sys.OS, feature string) (bool, error) {
 			return false, err
 		}
 
-		return ver.Compare(minVer) >= 0, nil
-	}
-
-	if feature == "nosymfollow" {
-		minVer, err := version.NewDottedVersion("4.0.0")
-		if err != nil {
-			return false, err
-		}
-
-		return ver.Compare(minVer) >= 0, nil
+		return aaVersion.Compare(minVer) >= 0, nil
 	}
 
 	return false, nil
-}
-
-// getVersion reads and parses the AppArmor version.
-func getVersion(sysOS *sys.OS) (*version.DottedVersion, error) {
-	if !sysOS.AppArmorAvailable {
-		return version.NewDottedVersion("0.0")
-	}
-
-	out, err := subprocess.RunCommand("apparmor_parser", "--version")
-	if err != nil {
-		return nil, err
-	}
-
-	fields := strings.Fields(strings.Split(out, "\n")[0])
-	return version.Parse(fields[len(fields)-1])
-}
-
-// getCacheDir returns the applicable AppArmor cache directory.
-func getCacheDir(sysOS *sys.OS) (string, error) {
-	basePath := filepath.Join(aaPath, "cache")
-
-	if !sysOS.AppArmorAvailable {
-		return basePath, nil
-	}
-
-	ver, err := getVersion(sysOS)
-	if err != nil {
-		return "", err
-	}
-
-	// Multiple policy cache directories were only added in v2.13.
-	minVer, err := version.NewDottedVersion("2.13")
-	if err != nil {
-		return "", err
-	}
-
-	if ver.Compare(minVer) < 0 {
-		return basePath, nil
-	}
-
-	output, err := subprocess.RunCommand("apparmor_parser", "-L", basePath, "--print-cache-dir")
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(output), nil
 }
 
 // profileName handles generating valid profile names.

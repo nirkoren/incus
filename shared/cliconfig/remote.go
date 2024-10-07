@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"golang.org/x/crypto/ssh"
@@ -161,6 +162,12 @@ func (c *Config) GetImageServer(name string) (incus.ImageServer, error) {
 		return nil, err
 	}
 
+	// Add image cache if specified.
+	if c.CacheDir != "" {
+		args.CachePath = c.CacheDir
+		args.CacheExpiry = 5 * time.Minute
+	}
+
 	// Unix socket
 	if strings.HasPrefix(remote.Addr, "unix:") {
 		d, err := incus.ConnectIncusUnix(strings.TrimPrefix(strings.TrimPrefix(remote.Addr, "unix:"), "//"), args)
@@ -182,6 +189,16 @@ func (c *Config) GetImageServer(name string) (incus.ImageServer, error) {
 	// HTTPs (simplestreams)
 	if remote.Protocol == "simplestreams" {
 		d, err := incus.ConnectSimpleStreams(remote.Addr, args)
+		if err != nil {
+			return nil, err
+		}
+
+		return d, nil
+	}
+
+	// HTTPs (OCI)
+	if remote.Protocol == "oci" {
+		d, err := incus.ConnectOCI(remote.Addr, args)
 		if err != nil {
 			return nil, err
 		}

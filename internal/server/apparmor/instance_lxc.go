@@ -37,6 +37,12 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   deny /proc/sys/fs/binfmt_misc/{,**} rwklx,
 {{- end }}
 
+{{- if .zfs_delegation }}
+
+  # Handle binfmt
+  mount fstype=zfs,
+{{- end }}
+
   # Handle cgroupfs
   mount options=(ro,nosuid,nodev,noexec,remount,strictatime) -> /sys/fs/cgroup/,
 
@@ -89,6 +95,9 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
 
   # Handle tmpfs
   mount fstype=tmpfs,
+
+  # Handle devpts
+  mount fstype=devpts,
 
   # Allow limited modification of mount propagation
   mount options=(rw,slave) -> /,
@@ -508,52 +517,7 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
 
   ### Configuration: unprivileged containers
   pivot_root,
-
-  # Allow modifying mount propagation
-  mount options=(rw,slave) -> /**,
-  mount options=(rw,rslave) -> /**,
-  mount options=(rw,shared) -> /**,
-  mount options=(rw,rshared) -> /**,
-  mount options=(rw,private) -> /**,
-  mount options=(rw,rprivate) -> /**,
-  mount options=(rw,unbindable) -> /**,
-  mount options=(rw,runbindable) -> /**,
-
-  # Allow all bind-mounts.
-  mount options=(rw,bind) -> /**,
-  mount options=(rw,rbind) -> /**,
-
-  # Allow all move-mounts.
-  mount options=(rw,move) -> /**,
-
-  # Allow common combinations of bind/remount
-  # NOTE: AppArmor bug effectively turns those into wildcards mount allow
-  mount options=(ro,remount,bind),
-  mount options=(ro,remount,bind,nodev),
-  mount options=(ro,remount,bind,nodev,nosuid),
-  mount options=(ro,remount,bind,noexec),
-  mount options=(ro,remount,bind,noexec,nodev),
-  mount options=(ro,remount,bind,nosuid),
-  mount options=(ro,remount,bind,nosuid,nodev),
-  mount options=(ro,remount,bind,nosuid,noexec),
-  mount options=(ro,remount,bind,nosuid,noexec,nodev),
-  mount options=(ro,remount,bind,noatime),
-  mount options=(ro,remount,bind,noatime,nodev),
-  mount options=(ro,remount,bind,noatime,noexec),
-  mount options=(ro,remount,bind,noatime,nosuid),
-  mount options=(ro,remount,bind,noatime,noexec,nodev),
-  mount options=(ro,remount,bind,noatime,nosuid,nodev),
-  mount options=(ro,remount,bind,noatime,nosuid,noexec),
-  mount options=(ro,remount,bind,noatime,nosuid,noexec,nodev),
-  mount options=(ro,remount,bind,nosuid,noexec,strictatime),
-  mount options=(ro,remount,nosuid,noexec,strictatime),
-{{- if .feature_nosymfollow }}
-  mount options=(ro,remount,bind,nosuid,noexec,nodev,nosymfollow),
-{{- end }}
-
-  # Allow remounting things read-only
-  mount options=(ro,remount) /,
-  mount options=(ro,remount) /**,
+  mount,
 {{- end }}
 
 {{- if .raw }}

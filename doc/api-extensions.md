@@ -2513,3 +2513,117 @@ delete everything inside of the project along with the project itself.
 ## `resources_cpu_flags`
 
 This exposes the CPU flags/extensions in our resources API to check the CPU features.
+
+## `disk_io_bus_cache_filesystem`
+
+This adds support for both `io.bus` and `io.cache` to disks that are backed by a file system.
+
+## `instance_oci`
+
+Adds initial support for running OCI containers.
+
+## `clustering_groups_config`
+
+This introduces a standard key/value `config` option to clustering
+groups which will allow placing some restrictions or configuration on
+those groups.
+
+## `instances_lxcfs_per_instance`
+
+This introduces a new `instances.lxcfs.per_instance` server
+configuration key to control whether to run LXCFS per instance instead
+of globally on the system.
+
+## `clustering_groups_vm_cpu_definition`
+
+This introduces a few new configuration options to control the virtual machine CPU definitions through cluster group configuration.
+
+The new configuration keys are:
+
+* `instances.vm.cpu.ARCHITECTURE.baseline`
+* `instances.vm.cpu.ARCHITECTURE.flag`
+
+## `disk_volume_subpath`
+
+This introduces the ability to access the sub-path of a file system custom volume by using the `source=volume/path` syntax.
+
+## `projects_limits_disk_pool`
+
+This introduces per-pool project disk limits, introducing a `limits.disk.pool.NAME` configuration option to the project limits.
+
+## `network_ovn_isolated`
+
+This allows using `none` as the uplink network for an OVN network, making the network isolated.
+
+## `qemu_raw_qmp`
+
+This adds new configuration options to virtual machines to directly issue QMP commands at various stages of startup:
+
+* `raw.qemu.qmp.early`
+* `raw.qemu.qmp.pre-start`
+* `raw.qemu.qmp.post-start`
+
+## `network_load_balancer_health_check`
+
+This adds the ability to perform health checks for load balancer backends.
+
+The following new configuration options are introduced:
+
+* `healthcheck`
+* `healthcheck.interval`
+* `healthcheck.timeout`
+* `healthcheck.failure_count`
+* `healthcheck.success_count`
+
+## `oidc_scopes`
+
+This introduces a new `oidc.scopes` server configuration key which can take a comma separate list of OIDC scopes to request from the identity provider.
+
+## `network_integrations_peer_name`
+
+This extends `ovn.transit.pattern` to allow `peerName` as a template variable.
+
+## `qemu_scriptlet`
+
+This adds the ability to run a scriptlet at various stages of startup: using the `raw.qemu.scriptlet` configuration key.
+
+## `instance_auto_restart`
+
+This introduces a new `boot.autorestart` configuration key which when
+set to `true` will have the instance automatically be restarted upon
+unexpected exit for up to 10 times over a 1 minute period.
+
+## `storage_lvm_metadatasize`
+
+This introduces a new `lvm.metadata_size` option for LVM storage pools
+which allows overriding the default metadata size when creating a new
+LVM physical volume.
+
+## `ovn_nic_promiscuous`
+
+This implements a new `security.promiscuous` configuration option on OVN NICs.
+
+## `ovn_nic_ip_address_none`
+
+This adds `none` as a value for `ipv4.address` and `ipv6.address` for OVN NICs.
+
+## `instances_state_os_info`
+
+This extension adds a pointer to an `InstanceStateOSInfo` struct to the instance's state API.
+
+## `network_load_balancer_state`
+
+This adds a new `/1.0/networks/NAME/load-balancers/IP/state` API endpoint
+which returns load-balancer health check information (when configured).
+
+## `instance_nic_macvlan_mode`
+
+This adds a `mode` configuration key on `macvlan` network interfaces which allows for configuring the Macvlan mode.
+
+## `storage_lvm_cluster_create`
+
+Allow for creating new LVM cluster pools by setting the `source` to the shared block device.
+
+## `network_ovn_external_interfaces`
+
+This adds support for `bridge.external_interfaces` on OVN networks.

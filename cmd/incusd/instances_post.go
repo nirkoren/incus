@@ -24,6 +24,7 @@ import (
 	"github.com/lxc/incus/v6/internal/server/instance"
 	"github.com/lxc/incus/v6/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v6/internal/server/instance/operationlock"
+	"github.com/lxc/incus/v6/internal/server/lifecycle"
 	"github.com/lxc/incus/v6/internal/server/operations"
 	"github.com/lxc/incus/v6/internal/server/project"
 	"github.com/lxc/incus/v6/internal/server/request"
@@ -59,7 +60,7 @@ func ensureDownloadedImageFitWithinBudget(ctx context.Context, s *state.State, r
 		return nil, err
 	}
 
-	imgDownloaded, err := ImageDownload(ctx, r, s, op, &ImageDownloadArgs{
+	imgDownloaded, created, err := ImageDownload(ctx, r, s, op, &ImageDownloadArgs{
 		Server:       source.Server,
 		Protocol:     source.Protocol,
 		Certificate:  source.Certificate,
@@ -75,6 +76,16 @@ func ensureDownloadedImageFitWithinBudget(ctx context.Context, s *state.State, r
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	if created {
+		// Add the image to the authorizer.
+		err = s.Authorizer.AddImage(s.ShutdownCtx, p.Name, imgDownloaded.Fingerprint)
+		if err != nil {
+			logger.Error("Failed to add image to authorizer", logger.Ctx{"fingerprint": imgDownloaded.Fingerprint, "project": p.Name, "error": err})
+		}
+
+		s.Events.SendLifecycle(p.Name, lifecycle.ImageCreated.Event(imgDownloaded.Fingerprint, p.Name, op.Requestor(), logger.Ctx{"type": imgDownloaded.Type}))
 	}
 
 	return imgDownloaded, nil
@@ -129,7 +140,7 @@ func createFromImage(s *state.State, r *http.Request, p api.Project, profiles []
 			return err
 		}
 
-		return instanceCreateFinish(s, req, args)
+		return instanceCreateFinish(s, req, args, op)
 	}
 
 	resources := map[string][]api.URL{}
@@ -177,12 +188,12 @@ func createFromNone(s *state.State, r *http.Request, projectName string, profile
 
 	run := func(op *operations.Operation) error {
 		// Actually create the instance.
-		_, err := instanceCreateAsEmpty(s, args)
+		_, err := instanceCreateAsEmpty(s, args, op)
 		if err != nil {
 			return err
 		}
 
-		return instanceCreateFinish(s, req, args)
+		return instanceCreateFinish(s, req, args, op)
 	}
 
 	resources := map[string][]api.URL{}
@@ -314,7 +325,7 @@ func createFromMigration(ctx context.Context, s *state.State, r *http.Request, p
 		// Note: At this stage we do not yet know if snapshots are going to be received and so we cannot
 		// create their DB records. This will be done if needed in the migrationSink.Do() function called
 		// as part of the operation below.
-		inst, instOp, cleanup, err = instance.CreateInternal(s, args, true, false)
+		inst, instOp, cleanup, err = instance.CreateInternal(s, args, nil, true, false)
 		if err != nil {
 			return response.InternalError(fmt.Errorf("Failed creating instance record: %w", err))
 		}
@@ -378,7 +389,7 @@ func createFromMigration(ctx context.Context, s *state.State, r *http.Request, p
 		instOp.Done(nil) // Complete operation that was created earlier, to release lock.
 		runRevert.Success()
 
-		return instanceCreateFinish(s, req, args)
+		return instanceCreateFinish(s, req, args, op)
 	}
 
 	resources := map[string][]api.URL{}
@@ -545,7 +556,7 @@ func createFromCopy(ctx context.Context, s *state.State, r *http.Request, projec
 			return err
 		}
 
-		return instanceCreateFinish(s, req, args)
+		return instanceCreateFinish(s, req, args, op)
 	}
 
 	resources := map[string][]api.URL{}
@@ -738,7 +749,7 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 
 		inst, err := instance.LoadByProjectAndName(s, bInfo.Project, bInfo.Name)
 		if err != nil {
-			return fmt.Errorf("Load instance: %w", err)
+			return fmt.Errorf("Failed loading instance: %w", err)
 		}
 
 		// Clean up created instance if the post hook fails below.
@@ -755,7 +766,7 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 
 		runRevert.Success()
 
-		return instanceCreateFinish(s, &req, db.InstanceArgs{Name: bInfo.Name, Project: bInfo.Project})
+		return instanceCreateFinish(s, &req, db.InstanceArgs{Name: bInfo.Name, Project: bInfo.Project}, op)
 	}
 
 	resources := map[string][]api.URL{}
@@ -982,6 +993,11 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 				return err
 			}
 
+			dbProfileDevices, err := dbCluster.GetDevices(ctx, tx.Tx(), "profile")
+			if err != nil {
+				return err
+			}
+
 			profilesByName := make(map[string]dbCluster.Profile, len(dbProfiles))
 			for _, dbProfile := range dbProfiles {
 				profilesByName[dbProfile.Name] = dbProfile
@@ -993,7 +1009,7 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 					return fmt.Errorf("Requested profile %q doesn't exist", profileName)
 				}
 
-				apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+				apiProfile, err := profile.ToAPI(ctx, tx.Tx(), dbProfileDevices)
 				if err != nil {
 					return err
 				}
@@ -1079,10 +1095,15 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	if s.ServerClustered && !clusterNotification && targetMemberInfo == nil {
-		// Run instance placement scriptlet if enabled and no cluster member selected yet.
+	if s.ServerClustered && !clusterNotification {
+		// If a target was specified, limit the list of candidates to that target.
+		if targetMemberInfo != nil {
+			candidateMembers = []db.NodeInfo{*targetMemberInfo}
+		}
+
+		// Run instance placement scriptlet if enabled.
 		if s.GlobalConfig.InstancesPlacementScriptlet() != "" {
-			leaderAddress, err := d.gateway.LeaderAddress()
+			leaderAddress, err := s.Cluster.LeaderAddress()
 			if err != nil {
 				return response.InternalError(err)
 			}
@@ -1313,7 +1334,7 @@ func clusterCopyContainerInternal(ctx context.Context, s *state.State, r *http.R
 	return createFromMigration(ctx, s, nil, projectName, profiles, req)
 }
 
-func instanceCreateFinish(s *state.State, req *api.InstancesPost, args db.InstanceArgs) error {
+func instanceCreateFinish(s *state.State, req *api.InstancesPost, args db.InstanceArgs, op *operations.Operation) error {
 	if req == nil || !req.Start {
 		return nil
 	}
@@ -1323,6 +1344,8 @@ func instanceCreateFinish(s *state.State, req *api.InstancesPost, args db.Instan
 	if err != nil {
 		return fmt.Errorf("Failed to load the instance: %w", err)
 	}
+
+	inst.SetOperation(op)
 
 	return inst.Start(false)
 }

@@ -1,7 +1,9 @@
 package drivers
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,18 +73,18 @@ func (d *zfs) load() error {
 		return nil
 	}
 
-	// Load the kernel module.
-	err := linux.LoadModule("zfs")
-	if err != nil {
-		return fmt.Errorf("Error loading %q module: %w", "zfs", err)
-	}
-
 	// Validate the needed tools are present.
 	for _, tool := range []string{"zpool", "zfs"} {
 		_, err := exec.LookPath(tool)
 		if err != nil {
 			return fmt.Errorf("Required tool '%s' is missing", tool)
 		}
+	}
+
+	// Load the kernel module.
+	err := linux.LoadModule("zfs")
+	if err != nil {
+		return fmt.Errorf("Error loading %q module: %w", "zfs", err)
 	}
 
 	// Get the version information.
@@ -138,6 +140,7 @@ func (d *zfs) Info() Info {
 		PreservesInodes:              true,
 		Remote:                       d.isRemote(),
 		VolumeTypes:                  []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeMultiNode:              d.isRemote(),
 		BlockBacking:                 util.IsTrue(d.config["volume.zfs.block_mode"]),
 		RunningCopyFreeze:            false,
 		DirectIO:                     zfsDirectIO,
@@ -451,7 +454,7 @@ func (d *zfs) Delete(op *operations.Operation) error {
 	// Delete any loop file we may have used
 	loopPath := loopFilePath(d.name)
 	err = os.Remove(loopPath)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("Failed to remove '%s': %w", loopPath, err)
 	}
 
@@ -508,7 +511,7 @@ func (d *zfs) Update(changedConfig map[string]string) error {
 			return err
 		}
 
-		_, err = subprocess.RunCommand("zpool", "online", "-e", d.name, loopPath)
+		_, err = subprocess.RunCommand("zpool", "online", "-e", d.config["zfs.pool_name"], loopPath)
 		if err != nil {
 			return err
 		}
@@ -756,4 +759,18 @@ func (d *zfs) parseSource() (string, []string) {
 	}
 
 	return vdevType, strings.Split(devices, ",")
+}
+
+// roundVolumeBlockSizeBytes returns sizeBytes rounded up to the next multiple
+// of `vol`'s "zfs.blocksize".
+func (d *zfs) roundVolumeBlockSizeBytes(vol Volume, sizeBytes int64) (int64, error) {
+	minBlockSize, err := units.ParseByteSizeString(vol.ExpandedConfig("zfs.blocksize"))
+
+	// minBlockSize will be 0 if zfs.blocksize=""
+	if minBlockSize <= 0 || err != nil {
+		// 16KiB is the default volblocksize
+		minBlockSize = 16 * 1024
+	}
+
+	return roundAbove(minBlockSize, sizeBytes), nil
 }

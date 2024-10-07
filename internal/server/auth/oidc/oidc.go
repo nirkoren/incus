@@ -14,6 +14,8 @@ import (
 	httphelper "github.com/zitadel/oidc/v3/pkg/http"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
+
+	"github.com/lxc/incus/v6/shared/util"
 )
 
 // Verifier holds all information needed to verify an access token offline.
@@ -22,6 +24,7 @@ type Verifier struct {
 
 	clientID  string
 	issuer    string
+	scopes    []string
 	audience  string
 	claim     string
 	cookieKey []byte
@@ -103,30 +106,33 @@ func (o *Verifier) Auth(ctx context.Context, w http.ResponseWriter, r *http.Requ
 			return "", &AuthError{err}
 		}
 
-		// Update the access token cookie.
-		accessCookie := http.Cookie{
-			Name:     "oidc_access",
-			Value:    tokens.AccessToken,
-			Path:     "/",
-			Secure:   true,
-			HttpOnly: false,
-			SameSite: http.SameSiteStrictMode,
-		}
-
-		http.SetCookie(w, &accessCookie)
-
-		// Update the refresh token cookie.
-		if tokens.RefreshToken != "" {
-			refreshCookie := http.Cookie{
-				Name:     "oidc_refresh",
-				Value:    tokens.RefreshToken,
+		// If we have a ResponseWriter, refresh the cookies.
+		if w != nil {
+			// Update the access token cookie.
+			accessCookie := http.Cookie{
+				Name:     "oidc_access",
+				Value:    tokens.AccessToken,
 				Path:     "/",
 				Secure:   true,
 				HttpOnly: false,
 				SameSite: http.SameSiteStrictMode,
 			}
 
-			http.SetCookie(w, &refreshCookie)
+			http.SetCookie(w, &accessCookie)
+
+			// Update the refresh token cookie.
+			if tokens.RefreshToken != "" {
+				refreshCookie := http.Cookie{
+					Name:     "oidc_refresh",
+					Value:    tokens.RefreshToken,
+					Path:     "/",
+					Secure:   true,
+					HttpOnly: false,
+					SameSite: http.SameSiteStrictMode,
+				}
+
+				http.SetCookie(w, &refreshCookie)
+			}
 		}
 	}
 
@@ -160,6 +166,21 @@ func (o *Verifier) Login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (o *Verifier) Logout(w http.ResponseWriter, r *http.Request) {
+	// Attempt to get the provider.
+	provider, _ := o.getProvider(r)
+
+	// Attempt to get the token.
+	var token string
+	cookie, err := r.Cookie("oidc_id")
+	if err == nil {
+		token = cookie.Value
+	}
+
+	// Attempt to end the OIDC session.
+	if provider != nil && token != "" {
+		_, _ = rp.EndSession(r.Context(), provider, token, fmt.Sprintf("https://%s", r.Host), "")
+	}
+
 	// Access token.
 	accessCookie := http.Cookie{
 		Name:     "oidc_access",
@@ -171,6 +192,18 @@ func (o *Verifier) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.SetCookie(w, &accessCookie)
+
+	// ID token.
+	idCookie := http.Cookie{
+		Name:     "oidc_id",
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: false,
+		SameSite: http.SameSiteStrictMode,
+		Expires:  time.Unix(0, 0),
+	}
+
+	http.SetCookie(w, &idCookie)
 
 	// Refresh token.
 	refreshCookie := http.Cookie{
@@ -217,6 +250,20 @@ func (o *Verifier) Callback(w http.ResponseWriter, r *http.Request) {
 			}
 
 			http.SetCookie(w, &refreshCookie)
+		}
+
+		// ID token.
+		if tokens.IDToken != "" {
+			idCookie := http.Cookie{
+				Name:     "oidc_id",
+				Value:    tokens.IDToken,
+				Path:     "/",
+				Secure:   true,
+				HttpOnly: false,
+				SameSite: http.SameSiteStrictMode,
+			}
+
+			http.SetCookie(w, &idCookie)
 		}
 
 		// Send to the UI.
@@ -283,9 +330,7 @@ func (o *Verifier) getProvider(r *http.Request) (rp.RelyingParty, error) {
 		rp.WithPKCE(cookieHandler),
 	}
 
-	oidcScopes := []string{oidc.ScopeOpenID, oidc.ScopeOfflineAccess}
-
-	provider, err := rp.NewRelyingPartyOIDC(context.TODO(), o.issuer, o.clientID, "", fmt.Sprintf("https://%s/oidc/callback", r.Host), oidcScopes, options...)
+	provider, err := rp.NewRelyingPartyOIDC(context.TODO(), o.issuer, o.clientID, "", fmt.Sprintf("https://%s/oidc/callback", r.Host), o.scopes, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -306,13 +351,14 @@ func getAccessTokenVerifier(issuer string) (*op.AccessTokenVerifier, error) {
 }
 
 // NewVerifier returns a Verifier.
-func NewVerifier(issuer string, clientid string, audience string, claim string) (*Verifier, error) {
+func NewVerifier(issuer string, clientid string, scope string, audience string, claim string) (*Verifier, error) {
 	cookieKey, err := uuid.New().MarshalBinary()
 	if err != nil {
 		return nil, fmt.Errorf("Failed to create UUID: %w", err)
 	}
 
-	verifier := &Verifier{issuer: issuer, clientID: clientid, audience: audience, cookieKey: cookieKey, claim: claim}
+	scopes := util.SplitNTrimSpace(scope, ",", -1, false)
+	verifier := &Verifier{issuer: issuer, clientID: clientid, scopes: scopes, audience: audience, cookieKey: cookieKey, claim: claim}
 	verifier.accessTokenVerifier, _ = getAccessTokenVerifier(issuer)
 
 	return verifier, nil

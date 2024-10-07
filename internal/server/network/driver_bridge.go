@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -29,7 +30,6 @@ import (
 	firewallDrivers "github.com/lxc/incus/v6/internal/server/firewall/drivers"
 	"github.com/lxc/incus/v6/internal/server/ip"
 	"github.com/lxc/incus/v6/internal/server/network/acl"
-	"github.com/lxc/incus/v6/internal/server/network/ovs"
 	"github.com/lxc/incus/v6/internal/server/project"
 	localUtil "github.com/lxc/incus/v6/internal/server/util"
 	"github.com/lxc/incus/v6/internal/server/warnings"
@@ -163,47 +163,10 @@ func (n *bridge) Validate(config map[string]string) error {
 		"bgp.ipv4.nexthop": validate.Optional(validate.IsNetworkAddressV4),
 		"bgp.ipv6.nexthop": validate.Optional(validate.IsNetworkAddressV6),
 
-		"bridge.driver": validate.Optional(validate.IsOneOf("native", "openvswitch")),
-		"bridge.external_interfaces": validate.Optional(func(value string) error {
-			for _, entry := range strings.Split(value, ",") {
-				entry = strings.TrimSpace(entry)
-
-				// Test for extended configuration of external interface.
-				entryParts := strings.Split(entry, "/")
-				if len(entryParts) == 3 {
-					// The first part is the interface name.
-					entry = strings.TrimSpace(entryParts[0])
-				}
-
-				err := validate.IsInterfaceName(entry)
-				if err != nil {
-					return fmt.Errorf("Invalid interface name %q: %w", entry, err)
-				}
-
-				if len(entryParts) == 3 {
-					// Check if the parent interface is valid.
-					parent := strings.TrimSpace(entryParts[1])
-					err := validate.IsInterfaceName(parent)
-					if err != nil {
-						return fmt.Errorf("Invalid interface name %q: %w", parent, err)
-					}
-
-					// Check if the VLAN ID is valid.
-					vlanID, err := strconv.Atoi(entryParts[2])
-					if err != nil {
-						return fmt.Errorf("Invalid VLAN ID %q: %w", entryParts[2], err)
-					}
-
-					if vlanID < 1 || vlanID > 4094 {
-						return fmt.Errorf("Invalid VLAN ID %q", entryParts[2])
-					}
-				}
-			}
-
-			return nil
-		}),
-		"bridge.hwaddr": validate.Optional(validate.IsNetworkMAC),
-		"bridge.mtu":    validate.Optional(validate.IsNetworkMTU),
+		"bridge.driver":              validate.Optional(validate.IsOneOf("native", "openvswitch")),
+		"bridge.external_interfaces": validate.Optional(validateExternalInterfaces),
+		"bridge.hwaddr":              validate.Optional(validate.IsNetworkMAC),
+		"bridge.mtu":                 validate.Optional(validate.IsNetworkMTU),
 
 		"ipv4.address": validate.Optional(func(value string) error {
 			if validate.IsOneOf("none", "auto")(value) == nil {
@@ -628,9 +591,9 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	// Create the bridge interface if doesn't exist.
 	if !n.isRunning() {
 		if n.config["bridge.driver"] == "openvswitch" {
-			vswitch, err := ovs.NewVSwitch()
-			if err != nil || !vswitch.Installed() {
-				return fmt.Errorf("Open vSwitch isn't installed on this system")
+			vswitch, err := n.state.OVS()
+			if err != nil {
+				return fmt.Errorf("Couldn't connect to OpenVSwitch: %v", err)
 			}
 
 			// Add and configure the interface in one operation to reduce the number of executions and
@@ -733,7 +696,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			revert.Add(func() { _ = dummy.Delete() })
 			err = dummy.SetUp()
 			if err == nil {
-				_ = AttachInterface(n.name, fmt.Sprintf("%s-mtu", n.name))
+				_ = AttachInterface(n.state, n.name, fmt.Sprintf("%s-mtu", n.name))
 			}
 		}
 	}
@@ -818,9 +781,16 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 				return fmt.Errorf("Only unconfigured network interfaces can be bridged")
 			}
 
-			err = AttachInterface(n.name, entry)
+			err = AttachInterface(n.state, n.name, entry)
 			if err != nil {
 				return err
+			}
+
+			// Make sure the port is up.
+			link := &ip.Link{Name: entry}
+			err = link.SetUp()
+			if err != nil {
+				return fmt.Errorf("Failed to bring up the host interface %s: %w", entry, err)
 			}
 		}
 	}
@@ -1156,7 +1126,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 
 				// If IPv6 router acceptance is enabled (set to 1) then we now set it to 2.
 				err = localUtil.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/accept_ra", entry.Name()), "2")
-				if err != nil && !os.IsNotExist(err) {
+				if err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return err
 				}
 			}
@@ -1164,7 +1134,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			// Then set forwarding for all of them.
 			for _, entry := range entries {
 				err = localUtil.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/forwarding", entry.Name()), "1")
-				if err != nil && !os.IsNotExist(err) {
+				if err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return err
 				}
 			}
@@ -1320,7 +1290,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 
 		// Bridge it and bring up.
-		err = AttachInterface(n.name, tunName)
+		err = AttachInterface(n.state, n.name, tunName)
 		if err != nil {
 			return err
 		}
@@ -1535,7 +1505,7 @@ func (n *bridge) Stop() error {
 
 	// Destroy the bridge interface
 	if n.config["bridge.driver"] == "openvswitch" {
-		vswitch, err := ovs.NewVSwitch()
+		vswitch, err := n.state.OVS()
 		if err != nil {
 			return err
 		}
@@ -1673,7 +1643,7 @@ func (n *bridge) Update(newNetwork api.NetworkPut, targetNode string, clientType
 				}
 
 				if !slices.Contains(devices, dev) && InterfaceExists(ifName) {
-					err = DetachInterface(n.name, ifName)
+					err = DetachInterface(n.state, n.name, ifName)
 					if err != nil {
 						return err
 					}

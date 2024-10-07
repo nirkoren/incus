@@ -178,7 +178,7 @@ func (m *Method) getMany(buf *file.Buffer) error {
 		buf.L("%s := strings.Replace(%s, \"%%s_id\", fmt.Sprintf(\"%%s_id\", parent), -1)", stmtLocal, stmtVar)
 		buf.L("fillParent := make([]any, strings.Count(%s, \"%%s\"))", stmtLocal)
 		buf.L("for i := range fillParent {")
-		buf.L("fillParent[i] = strings.Replace(parent, \"_\", \"s_\", -1) + \"s\"")
+		buf.L("fillParent[i] = strings.Replace(strings.Replace(parent, \"_\", \"s_\", -1), \"clusters_\", \"cluster_\", -1) + \"s\"")
 		buf.L("}")
 		buf.N()
 		buf.L("queryStr := fmt.Sprintf(%s, fillParent...)", stmtLocal)
@@ -702,7 +702,7 @@ func (m *Method) create(buf *file.Buffer, replace bool) error {
 		buf.L("%s := strings.Replace(%s, \"%%s_id\", fmt.Sprintf(\"%%s_id\", parent), -1)", stmtLocal, stmtVar)
 		buf.L("fillParent := make([]any, strings.Count(%s, \"%%s\"))", stmtLocal)
 		buf.L("for i := range fillParent {")
-		buf.L("fillParent[i] = strings.Replace(parent, \"_\", \"s_\", -1) + \"s\"")
+		buf.L("fillParent[i] = strings.Replace(strings.Replace(parent, \"_\", \"s_\", -1), \"clusters_\", \"cluster_\", -1) + \"s\"")
 		buf.L("}")
 		buf.N()
 		buf.L("queryStr := fmt.Sprintf(%s, fillParent...)", stmtLocal)
@@ -1151,7 +1151,7 @@ func (m *Method) delete(buf *file.Buffer, deleteOne bool) error {
 		buf.L("%s := strings.Replace(%s, \"%%s_id\", fmt.Sprintf(\"%%s_id\", parent), -1)", stmtLocal, stmtVar)
 		buf.L("fillParent := make([]any, strings.Count(%s, \"%%s\"))", stmtLocal)
 		buf.L("for i := range fillParent {")
-		buf.L("fillParent[i] = strings.Replace(parent, \"_\", \"s_\", -1) + \"s\"")
+		buf.L("fillParent[i] = strings.Replace(strings.Replace(parent, \"_\", \"s_\", -1), \"clusters_\", \"cluster_\", -1) + \"s\"")
 		buf.L("}")
 		buf.N()
 		buf.L("queryStr := fmt.Sprintf(%s, fillParent...)", stmtLocal)
@@ -1227,6 +1227,12 @@ func (m *Method) signature(buf *file.Buffer, isInterface bool) error {
 			rets = "error"
 		case "Update":
 			comment = fmt.Sprintf("updates the %s matching the given key parameters.", m.entity)
+			if len(refMapping.NaturalKey()) > 1 {
+				return fmt.Errorf("Cannot generate update method for associative table: Reference table struct %q has more than one natural key", ref)
+			} else if refMapping.Identifier() == nil {
+				return fmt.Errorf("Cannot generate update method for associative table: Identifier for reference table struct %q must be `Name` or `Fingerprint`", ref)
+			}
+
 			args += fmt.Sprintf("%sID int, %s%s []%s", lex.Minuscule(m.config["struct"]), lex.Minuscule(ref), lex.Plural(refMapping.Identifier().Name), refMapping.Identifier().Type.Name)
 			rets = "error"
 		case "DeleteMany":

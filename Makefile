@@ -93,9 +93,8 @@ ifneq "$(INCUS_OFFLINE)" ""
 	@echo "The update-gomod target cannot be run in offline mode."
 	exit 1
 endif
-	$(GO) get -t -v -d -u ./...
-	$(GO) get github.com/go-acme/lego/v4@v4.16.1
-	$(GO) mod tidy --go=1.21
+	$(GO) get -t -v -u ./...
+	$(GO) mod tidy --go=1.22.7
 	$(GO) get toolchain@none
 
 	@echo "Dependencies updated"
@@ -312,7 +311,7 @@ endif
 	flake8 test/deps/import-busybox
 	shellcheck --shell sh test/*.sh test/includes/*.sh test/suites/*.sh test/backends/*.sh test/lint/*.sh
 	shellcheck test/extras/*.sh
-	run-parts --exit-on-error --regex '.sh' test/lint
+	run-parts $(shell run-parts -V >/dev/null 2>&1 && echo -n "--verbose --exit-on-error --regex '.sh'") test/lint
 
 .PHONY: staticcheck
 staticcheck:

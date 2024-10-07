@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"math/rand"
 	"mime"
@@ -336,11 +337,19 @@ func imgPostInstanceInfo(ctx context.Context, s *state.State, r *http.Request, r
 		writer = io.MultiWriter(imageProgressWriter, sha256)
 	}
 
+	// Tracker instance for the export phase.
+	tracker := &ioprogress.ProgressTracker{
+		Handler: func(value, speed int64) {
+			operations.SetProgressMetadata(metadata, "create_image_from_container_pack", "Exporting", value, 0, 0)
+			_ = op.UpdateMetadata(metadata)
+		},
+	}
+
 	// Export instance to writer.
 	var meta api.ImageMetadata
 
 	writer = internalIO.NewQuotaWriter(writer, budget)
-	meta, err = c.Export(writer, req.Properties, req.ExpiresAt)
+	meta, err = c.Export(writer, req.Properties, req.ExpiresAt, tracker)
 
 	// Get ExpiresAt
 	if meta.ExpiryDate != 0 {
@@ -419,7 +428,7 @@ func imgPostRemoteInfo(ctx context.Context, s *state.State, r *http.Request, req
 		return nil, fmt.Errorf("must specify one of alias or fingerprint for init from image")
 	}
 
-	info, err := ImageDownload(ctx, r, s, op, &ImageDownloadArgs{
+	info, _, err := ImageDownload(ctx, r, s, op, &ImageDownloadArgs{
 		Server:            req.Source.Server,
 		Protocol:          req.Source.Protocol,
 		Certificate:       req.Source.Certificate,
@@ -434,6 +443,11 @@ func imgPostRemoteInfo(ctx context.Context, s *state.State, r *http.Request, req
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// If just dealing with an internal copy, we're done here.
+	if isClusterNotification(r) && req.Source.Server == "" {
+		return info, nil
 	}
 
 	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
@@ -532,7 +546,7 @@ func imgPostURLInfo(ctx context.Context, s *state.State, r *http.Request, req ap
 	}
 
 	// Import the image
-	info, err := ImageDownload(ctx, r, s, op, &ImageDownloadArgs{
+	info, _, err := ImageDownload(ctx, r, s, op, &ImageDownloadArgs{
 		Server:      url,
 		Protocol:    "direct",
 		Alias:       hash,
@@ -1183,6 +1197,14 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 				if err != nil {
 					return fmt.Errorf("Add new image alias to the database: %w", err)
 				}
+
+				// Add the image alias to the authorizer.
+				err = s.Authorizer.AddImageAlias(r.Context(), projectName, alias.Name)
+				if err != nil {
+					logger.Error("Failed to add image alias to authorizer", logger.Ctx{"name": alias.Name, "project": projectName, "error": err})
+				}
+
+				s.Events.SendLifecycle(projectName, lifecycle.ImageAliasCreated.Event(alias.Name, projectName, op.Requestor(), logger.Ctx{"target": info.Fingerprint}))
 			}
 
 			return nil
@@ -1194,7 +1216,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		// Sync the images between each node in the cluster on demand
 		err = imageSyncBetweenNodes(context.TODO(), s, r, projectName, info.Fingerprint)
 		if err != nil {
-			return fmt.Errorf("Failed syncing image between nodes: %w", err)
+			return fmt.Errorf("Failed syncing image between servers: %w", err)
 		}
 
 		// Add the image to the authorizer.
@@ -2176,7 +2198,7 @@ func autoUpdateImage(ctx context.Context, s *state.State, op *operations.Operati
 		default:
 		}
 
-		newInfo, err = ImageDownload(ctx, nil, s, op, &ImageDownloadArgs{
+		newInfo, _, err = ImageDownload(ctx, nil, s, op, &ImageDownloadArgs{
 			Server:      source.Server,
 			Protocol:    source.Protocol,
 			Certificate: source.Certificate,
@@ -2263,6 +2285,19 @@ func autoUpdateImage(ctx context.Context, s *state.State, op *operations.Operati
 				continue
 			}
 		}
+
+		// Add the image to the authorizer.
+		err = s.Authorizer.AddImage(s.ShutdownCtx, projectName, info.Fingerprint)
+		if err != nil {
+			logger.Error("Failed to add image to authorizer", logger.Ctx{"fingerprint": info.Fingerprint, "project": projectName, "error": err})
+		}
+
+		var requestor *api.EventLifecycleRequestor
+		if op != nil {
+			requestor = op.Requestor()
+		}
+
+		s.Events.SendLifecycle(projectName, lifecycle.ImageCreated.Event(info.Fingerprint, projectName, requestor, logger.Ctx{"type": info.Type}))
 	}
 
 	// Image didn't change, nothing to do.
@@ -2589,14 +2624,14 @@ func pruneExpiredImages(ctx context.Context, s *state.State, op *operations.Oper
 		// Remove main image file.
 		fname := filepath.Join(s.OS.VarDir, "images", fingerprint)
 		err = os.Remove(fname)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("Error deleting image file %q: %w", fname, err)
 		}
 
 		// Remove the rootfs file for the image.
 		fname = filepath.Join(s.OS.VarDir, "images", fingerprint) + ".rootfs"
 		err = os.Remove(fname)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("Error deleting image file %q: %w", fname, err)
 		}
 
@@ -2733,6 +2768,24 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 			if err != nil {
 				return err
 			}
+
+			// Delete the aliases.
+			for _, alias := range imgInfo.Aliases {
+				err = s.Authorizer.DeleteImageAlias(s.ShutdownCtx, projectName, alias.Name)
+				if err != nil {
+					logger.Error("Failed to remove image alias from authorizer", logger.Ctx{"name": alias.Name, "project": projectName, "error": err})
+				}
+
+				s.Events.SendLifecycle(projectName, lifecycle.ImageAliasDeleted.Event(alias.Name, projectName, op.Requestor(), nil))
+			}
+
+			// Remove image from authorizer.
+			err = s.Authorizer.DeleteImage(s.ShutdownCtx, projectName, imgInfo.Fingerprint)
+			if err != nil {
+				logger.Error("Failed to remove image from authorizer", logger.Ctx{"fingerprint": imgInfo.Fingerprint, "project": projectName, "error": err})
+			}
+
+			s.Events.SendLifecycle(projectName, lifecycle.ImageDeleted.Event(imgInfo.Fingerprint, projectName, op.Requestor(), nil))
 		}
 
 		var poolIDs []int64
@@ -2784,14 +2837,6 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 		// Remove main image file from disk.
 		imageDeleteFromDisk(imgInfo.Fingerprint)
 
-		// Remove image from authorizer.
-		err = s.Authorizer.DeleteImage(s.ShutdownCtx, projectName, imgInfo.Fingerprint)
-		if err != nil {
-			logger.Error("Failed to remove image from authorizer", logger.Ctx{"fingerprint": imgInfo.Fingerprint, "project": projectName, "error": err})
-		}
-
-		s.Events.SendLifecycle(projectName, lifecycle.ImageDeleted.Event(imgInfo.Fingerprint, projectName, op.Requestor(), nil))
-
 		return nil
 	}
 
@@ -2812,7 +2857,7 @@ func imageDeleteFromDisk(fingerprint string) {
 	fname := internalUtil.VarPath("images", fingerprint)
 	if util.PathExists(fname) {
 		err := os.Remove(fname)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			logger.Errorf("Error deleting image file %s: %s", fname, err)
 		}
 	}
@@ -2821,7 +2866,7 @@ func imageDeleteFromDisk(fingerprint string) {
 	fname = internalUtil.VarPath("images", fingerprint) + ".rootfs"
 	if util.PathExists(fname) {
 		err := os.Remove(fname)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			logger.Errorf("Error deleting image file %s: %s", fname, err)
 		}
 	}
@@ -2870,10 +2915,13 @@ func imageValidSecret(s *state.State, r *http.Request, projectName string, finge
 		}
 
 		if opSecret == secret {
-			// Token is single-use, so cancel it now.
-			err = operationCancel(s, r, projectName, op)
-			if err != nil {
-				return nil, fmt.Errorf("Failed to cancel operation %q: %w", op.ID, err)
+			// Check if the operation is currently running (we allow access while expired).
+			if op.Status == api.Running.String() {
+				// Token is single-use, so cancel it now.
+				err = operationCancel(s, r, projectName, op)
+				if err != nil {
+					return nil, fmt.Errorf("Failed to cancel operation %q: %w", op.ID, err)
+				}
 			}
 
 			return op, nil
@@ -4062,6 +4110,14 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 		return response.ForwardedResponse(client, r)
 	}
 
+	// Set image type header.
+	headers := map[string]string{}
+
+	headers["X-Incus-Type"] = "incus"
+	if imgInfo.Properties != nil && imgInfo.Properties["type"] == "oci" {
+		headers["X-Incus-Type"] = "oci"
+	}
+
 	imagePath := internalUtil.VarPath("images", imgInfo.Fingerprint)
 	rootfsPath := imagePath + ".rootfs"
 
@@ -4097,7 +4153,7 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 		files[1].Path = rootfsPath
 		files[1].Filename = filename
 
-		return response.FileResponse(r, files, nil)
+		return response.FileResponse(r, files, headers)
 	}
 
 	files := make([]response.FileResponseEntry, 1)
@@ -4108,7 +4164,7 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 	requestor := request.CreateRequestor(r)
 	s.Events.SendLifecycle(projectName, lifecycle.ImageRetrieved.Event(imgInfo.Fingerprint, projectName, requestor, nil))
 
-	return response.FileResponse(r, files, nil)
+	return response.FileResponse(r, files, headers)
 }
 
 // swagger:operation POST /1.0/images/{fingerprint}/export images images_export_post
@@ -4471,15 +4527,13 @@ func imageRefresh(d *Daemon, r *http.Request) response.Response {
 	return operations.OperationResponse(op)
 }
 
-func autoSyncImagesTask(d *Daemon) (task.Func, task.Schedule) {
+func autoSyncImagesTask(s *state.State) (task.Func, task.Schedule) {
 	f := func(ctx context.Context) {
-		s := d.State()
-
 		// In order to only have one task operation executed per image when syncing the images
 		// across the cluster, only leader node can launch the task, no others.
 		localClusterAddress := s.LocalConfig.ClusterAddress()
 
-		leader, err := d.gateway.LeaderAddress()
+		leader, err := s.Cluster.LeaderAddress()
 		if err != nil {
 			if errors.Is(err, cluster.ErrNodeIsNotClustered) {
 				return // No error if not clustered.
@@ -4548,7 +4602,7 @@ func autoSyncImages(ctx context.Context, s *state.State) error {
 		go func(projectName string, fingerprint string) {
 			err := imageSyncBetweenNodes(ctx, s, nil, projectName, fingerprint)
 			if err != nil {
-				logger.Error("Failed to synchronize images", logger.Ctx{"err": err, "fingerprint": fingerprint})
+				logger.Error("Failed to synchronize images", logger.Ctx{"err": err, "project": projectName, "fingerprint": fingerprint})
 			}
 
 			ch <- nil
@@ -4632,10 +4686,14 @@ func imageSyncBetweenNodes(ctx context.Context, s *state.State, r *http.Request,
 		return fmt.Errorf("Failed to get image: %w", err)
 	}
 
-	// Populate the copy arguments with properties from the source image.
-	args := incus.ImageCopyArgs{
-		Type:   image.Type,
-		Public: image.Public,
+	// Set up the image download request.
+	req := api.ImagesPost{
+		Source: &api.ImagesPostSource{
+			Fingerprint: image.Fingerprint,
+			Mode:        "pull",
+			Type:        "image",
+			Project:     project,
+		},
 	}
 
 	// Replicate on as many nodes as needed.
@@ -4669,8 +4727,8 @@ func imageSyncBetweenNodes(ctx context.Context, s *state.State, r *http.Request,
 		client = client.UseProject(project)
 
 		// Copy the image to the target server.
-		logger.Info("Copying image to member", logger.Ctx{"fingerprint": fingerprint, "address": targetNodeAddress, "project": project, "public": args.Public, "type": args.Type})
-		op, err := client.CopyImage(source, *image, &args)
+		logger.Info("Copying image to member", logger.Ctx{"fingerprint": fingerprint, "address": targetNodeAddress, "project": project})
+		op, err := client.CreateImage(req, nil)
 		if err != nil {
 			return fmt.Errorf("Failed to copy image to %q: %w", targetNodeAddress, err)
 		}

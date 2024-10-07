@@ -22,6 +22,11 @@ import (
 	localtls "github.com/lxc/incus/v6/shared/tls"
 )
 
+// Set references.
+func init() {
+	storagePools.ConnectIfInstanceIsRemote = ConnectIfInstanceIsRemote
+}
+
 // Connect is a convenience around incus.ConnectIncus that configures the client
 // with the correct parameters for node-to-node communication.
 //
@@ -35,7 +40,7 @@ func Connect(address string, networkCert *localtls.CertInfo, serverCert *localtl
 		defer cancel()
 		err := EventListenerWait(ctx, address)
 		if err != nil {
-			return nil, fmt.Errorf("Missing event connection with target cluster member")
+			return nil, err
 		}
 	}
 
@@ -149,9 +154,19 @@ func ConnectIfVolumeIsRemote(s *state.State, poolName string, projectName string
 			return nil, err
 		}
 
-		remoteInstance, err := storagePools.VolumeUsedByExclusiveRemoteInstancesWithProfiles(s, poolName, projectName, &dbVolume.StorageVolume)
-		if err != nil {
-			return nil, fmt.Errorf("Failed checking if volume %q is available: %w", volumeName, err)
+		// Find if volume is attached to a remote instance.
+		var remoteInstance *db.InstanceArgs
+		err = storagePools.VolumeUsedByInstanceDevices(s, poolName, projectName, &dbVolume.StorageVolume, true, func(dbInst db.InstanceArgs, project api.Project, usedByDevices []string) error {
+			if dbInst.Node == s.ServerName {
+				remoteInstance = nil
+				return db.ErrInstanceListStop // Stop the search if the volume is attached to the local system.
+			}
+
+			remoteInstance = &dbInst
+			return nil
+		})
+		if err != nil && err != db.ErrInstanceListStop {
+			return nil, err
 		}
 
 		if remoteInstance != nil {
@@ -271,7 +286,17 @@ func UpdateTrust(serverCert *localtls.CertInfo, serverName string, targetAddress
 }
 
 // HasConnectivity probes the member with the given address for connectivity.
-func HasConnectivity(networkCert *localtls.CertInfo, serverCert *localtls.CertInfo, address string) bool {
+func HasConnectivity(networkCert *localtls.CertInfo, serverCert *localtls.CertInfo, address string, apiCheck bool) bool {
+	if apiCheck {
+		c, err := Connect(address, networkCert, serverCert, nil, true)
+		if err != nil {
+			return false
+		}
+
+		_, _, err = c.GetServer()
+		return err == nil
+	}
+
 	config, err := tlsClientConfig(networkCert, serverCert)
 	if err != nil {
 		return false

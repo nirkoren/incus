@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -107,6 +106,7 @@ type OVNDHCPv4Opts struct {
 	LeaseTime          time.Duration
 	MTU                uint32
 	Netmask            string
+	DNSSearchList      []string
 }
 
 // OVNDHCPv6Opts IPv6 DHCP option set that can be created (and then applied to a switch port by resulting ID).
@@ -119,13 +119,15 @@ type OVNDHCPv6Opts struct {
 // OVNSwitchPortOpts options that can be applied to a swich port.
 type OVNSwitchPortOpts struct {
 	MAC          net.HardwareAddr   // Optional, if nil will be set to dynamic.
-	IPs          []net.IP           // Optional, if empty IPs will be set to dynamic.
+	IPV4         string             // Optional, if empty, allocate an address, if "none" then disable allocation.
+	IPV6         string             // Optional, if empty, allocate an address, if "none" then disable allocation.
 	DHCPv4OptsID OVNDHCPOptionsUUID // Optional, if empty, no DHCPv4 enabled on port.
 	DHCPv6OptsID OVNDHCPOptionsUUID // Optional, if empty, no DHCPv6 enabled on port.
 	Parent       OVNSwitchPort      // Optional, if set a nested port is created.
 	VLAN         uint16             // Optional, use with Parent to request a specific VLAN for nested port.
 	Location     string             // Optional, use to indicate the name of the server this port is bound to.
 	RouterPort   OVNRouterPort      // Optional, the name of the associated logical router port.
+	Promiscuous  bool               // Optional, controls whether to allow unknown traffic on the port.
 }
 
 // OVNACLRule represents an ACL rule that can be added to a logical switch or port group.
@@ -144,8 +146,20 @@ type OVNLoadBalancerTarget struct {
 	Port    uint64
 }
 
+// OVNLoadBalancerHealthCheck represents an OVN load balancer health checker.
+type OVNLoadBalancerHealthCheck struct {
+	Interval     int
+	Timeout      int
+	SuccessCount int
+	FailureCount int
+
+	CheckerIPV4 net.IP
+	CheckerIPV6 net.IP
+}
+
 // OVNLoadBalancerVIP represents a OVN load balancer Virtual IP entry.
 type OVNLoadBalancerVIP struct {
+	HealthCheck   *OVNLoadBalancerHealthCheck
 	Protocol      string // Either "tcp" or "udp". But only applies to port based VIPs.
 	ListenAddress net.IP
 	ListenPort    uint64
@@ -197,17 +211,33 @@ func (o *NB) CreateLogicalRouter(ctx context.Context, routerName OVNRouter, mayE
 	}
 
 	if logicalRouter.UUID != "" {
-		if mayExist {
-			return nil
+		if !mayExist {
+			return ErrExists
 		}
 
-		return ErrExists
+		if logicalRouter.Options != nil {
+			return nil
+		}
+	}
+
+	// Set some options.
+	logicalRouter.Options = map[string]string{
+		"always_learn_from_arp_request": "false",
+		"dynamic_neigh_routers":         "true",
 	}
 
 	// Create the record.
-	operations, err := o.client.Create(&logicalRouter)
-	if err != nil {
-		return err
+	var operations []ovsdb.Operation
+	if logicalRouter.UUID == "" {
+		operations, err = o.client.Create(&logicalRouter)
+		if err != nil {
+			return err
+		}
+	} else {
+		operations, err = o.client.Where(&logicalRouter).Update(&logicalRouter)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Apply the changes.
@@ -824,7 +854,9 @@ func (o *NB) UpdateLogicalRouterPort(ctx context.Context, portName OVNRouterPort
 	}
 
 	if ipv6ra != nil {
-		ipv6conf := map[string]string{}
+		ipv6conf := map[string]string{
+			"send_periodic": fmt.Sprintf("%t", ipv6ra.SendPeriodic),
+		}
 
 		if ipv6ra.AddressMode != "" {
 			ipv6conf["address_mode"] = string(ipv6ra.AddressMode)
@@ -1223,6 +1255,11 @@ func (o *NB) UpdateLogicalSwitchDHCPv4Options(ctx context.Context, switchName OV
 		dhcpOption.Options["router"] = opts.Router.String()
 	}
 
+	if len(opts.DNSSearchList) > 0 {
+		// Special quoting to allow domain names.
+		dhcpOption.Options["domain_search_list"] = fmt.Sprintf(`"%s"`, strings.Join(opts.DNSSearchList, ","))
+	}
+
 	if opts.RecursiveDNSServer != nil {
 		nsIPs := make([]string, 0, len(opts.RecursiveDNSServer))
 		for _, nsIP := range opts.RecursiveDNSServer {
@@ -1425,19 +1462,49 @@ func (o *NB) DeleteLogicalSwitchDHCPOption(ctx context.Context, switchName OVNSw
 	return nil
 }
 
-// LogicalSwitchSetACLRules applies a set of rules to the specified logical switch. Any existing rules are removed.
-func (o *NB) LogicalSwitchSetACLRules(switchName OVNSwitch, aclRules ...OVNACLRule) error {
+// UpdateLogicalSwitchACLRules applies a set of rules to the specified logical switch. Any existing rules are removed.
+func (o *NB) UpdateLogicalSwitchACLRules(ctx context.Context, switchName OVNSwitch, aclRules ...OVNACLRule) error {
+	operations := []ovsdb.Operation{}
+
+	// Get the logical switch.
+	ls, err := o.GetLogicalSwitch(ctx, switchName)
+	if err != nil {
+		return err
+	}
+
 	// Remove any existing rules assigned to the entity.
-	args := []string{"clear", "logical_switch", string(switchName), "acls"}
+	for _, aclUUID := range ls.ACLs {
+		updateOps, err := o.client.Where(ls).Mutate(ls, ovsModel.Mutation{
+			Field:   &ls.ACLs,
+			Mutator: ovsdb.MutateOperationDelete,
+			Value:   []string{aclUUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
+	}
 
 	// Add new rules.
 	externalIDs := map[string]string{
 		ovnExtIDIncusSwitch: string(switchName),
 	}
 
-	args = o.aclRuleAddAppendArgs(args, "logical_switch", string(switchName), externalIDs, nil, aclRules...)
+	createOps, err := o.aclRuleAddOperations(ctx, "logical_switch", string(switchName), externalIDs, nil, aclRules...)
+	if err != nil {
+		return err
+	}
 
-	_, err := o.nbctl(args...)
+	operations = append(operations, createOps...)
+
+	// Apply the database changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -1491,34 +1558,42 @@ func (o *NB) GetLogicalSwitchPorts(ctx context.Context, switchName OVNSwitch) (m
 	return ports, nil
 }
 
-// LogicalSwitchIPs returns a list of IPs associated to each port connected to switch.
-func (o *NB) LogicalSwitchIPs(switchName OVNSwitch) (map[OVNSwitchPort][]net.IP, error) {
-	output, err := o.nbctl("--format=csv", "--no-headings", "--data=bare", "--colum=name,addresses,dynamic_addresses", "find", "logical_switch_port",
-		fmt.Sprintf("external_ids:%s=%s", ovnExtIDIncusSwitch, switchName),
-	)
+// GetLogicalSwitchIPs returns a list of IPs associated to each port connected to switch.
+func (o *NB) GetLogicalSwitchIPs(ctx context.Context, switchName OVNSwitch) (map[OVNSwitchPort][]net.IP, error) {
+	lsps := []ovnNB.LogicalSwitchPort{}
+
+	err := o.client.WhereCache(func(lsp *ovnNB.LogicalSwitchPort) bool {
+		return lsp.ExternalIDs != nil && lsp.ExternalIDs[ovnExtIDIncusSwitch] == string(switchName)
+	}).List(ctx, &lsps)
 	if err != nil {
 		return nil, err
 	}
 
-	lines := util.SplitNTrimSpace(strings.TrimSpace(output), "\n", -1, true)
-	portIPs := make(map[OVNSwitchPort][]net.IP, len(lines))
-
-	for _, line := range lines {
-		fields := util.SplitNTrimSpace(line, ",", -1, true)
-		portName := OVNSwitchPort(fields[0])
+	portIPs := make(map[OVNSwitchPort][]net.IP, len(lsps))
+	for _, lsp := range lsps {
 		var ips []net.IP
 
-		// Parse all IPs mentioned in addresses and dynamic_addresses fields.
-		for i := 1; i < len(fields); i++ {
-			for _, address := range util.SplitNTrimSpace(fields[i], " ", -1, true) {
-				ip := net.ParseIP(address)
+		// Extract all addresses from the Addresses field.
+		for _, address := range lsp.Addresses {
+			for _, entry := range util.SplitNTrimSpace(address, " ", -1, true) {
+				ip := net.ParseIP(entry)
 				if ip != nil {
 					ips = append(ips, ip)
 				}
 			}
 		}
 
-		portIPs[portName] = ips
+		// Extract all addresses from the DynamicAddresses field.
+		if lsp.DynamicAddresses != nil {
+			for _, entry := range util.SplitNTrimSpace(*lsp.DynamicAddresses, " ", -1, true) {
+				ip := net.ParseIP(entry)
+				if ip != nil {
+					ips = append(ips, ip)
+				}
+			}
+		}
+
+		portIPs[OVNSwitchPort(lsp.Name)] = ips
 	}
 
 	return portIPs, nil
@@ -1544,9 +1619,8 @@ func (o *NB) GetLogicalSwitchPortUUID(ctx context.Context, portName OVNSwitchPor
 func (o *NB) CreateLogicalSwitchPort(ctx context.Context, switchName OVNSwitch, portName OVNSwitchPort, opts *OVNSwitchPortOpts, mayExist bool) error {
 	// Prepare the new switch port entry.
 	logicalSwitchPort := ovnNB.LogicalSwitchPort{
-		Name:        string(portName),
-		UUID:        "lsp",
-		ExternalIDs: map[string]string{},
+		Name: string(portName),
+		UUID: "lsp",
 	}
 
 	// Check if the entry already exists.
@@ -1557,6 +1631,10 @@ func (o *NB) CreateLogicalSwitchPort(ctx context.Context, switchName OVNSwitch, 
 
 	if logicalSwitchPort.UUID != "lsp" && !mayExist {
 		return ErrExists
+	}
+
+	if logicalSwitchPort.ExternalIDs == nil {
+		logicalSwitchPort.ExternalIDs = map[string]string{}
 	}
 
 	// Set switch port options if supplied.
@@ -1575,31 +1653,47 @@ func (o *NB) CreateLogicalSwitchPort(ctx context.Context, switchName OVNSwitch, 
 			logicalSwitchPort.Addresses = []string{"router"}
 			logicalSwitchPort.Options = map[string]string{"router-port": string(opts.RouterPort)}
 		} else {
-			ipStr := make([]string, 0, len(opts.IPs))
-			for _, ip := range opts.IPs {
-				ipStr = append(ipStr, ip.String())
+			if (opts.IPV4 == "none" && opts.IPV6 != "none") || (opts.IPV6 == "none" && opts.IPV4 != "none") {
+				return fmt.Errorf("OVN doesn't support disabling IP allocation on only one protocol")
 			}
 
-			var addresses string
-			if opts.MAC != nil && len(ipStr) > 0 {
-				addresses = fmt.Sprintf("%s %s", opts.MAC.String(), strings.Join(ipStr, " "))
-			} else if opts.MAC != nil && len(ipStr) <= 0 {
-				addresses = fmt.Sprintf("%s %s", opts.MAC.String(), "dynamic")
-			} else {
-				addresses = "dynamic"
+			addresses := []string{}
+			if opts.IPV4 != "none" && opts.IPV6 != "none" {
+				address := []string{}
+				if opts.MAC != nil {
+					address = append(address, opts.MAC.String())
+				}
+
+				if opts.IPV4 == "" && opts.IPV6 == "" {
+					address = append(address, "dynamic")
+				} else {
+					if opts.IPV4 != "" {
+						address = append(address, opts.IPV4)
+					}
+
+					if opts.IPV6 != "" {
+						address = append(address, opts.IPV6)
+					}
+				}
+
+				addresses = append(addresses, strings.Join(address, " "))
 			}
 
-			logicalSwitchPort.Addresses = []string{addresses}
-		}
+			if opts.DHCPv4OptsID != "" {
+				dhcp4opts := string(opts.DHCPv4OptsID)
+				logicalSwitchPort.Dhcpv4Options = &dhcp4opts
+			}
 
-		if opts.DHCPv4OptsID != "" {
-			dhcp4opts := string(opts.DHCPv4OptsID)
-			logicalSwitchPort.Dhcpv4Options = &dhcp4opts
-		}
+			if opts.DHCPv6OptsID != "" {
+				dhcp6opts := string(opts.DHCPv6OptsID)
+				logicalSwitchPort.Dhcpv6Options = &dhcp6opts
+			}
 
-		if opts.DHCPv6OptsID != "" {
-			dhcp6opts := string(opts.DHCPv6OptsID)
-			logicalSwitchPort.Dhcpv6Options = &dhcp6opts
+			if opts.Promiscuous {
+				addresses = append(addresses, "unknown")
+			}
+
+			logicalSwitchPort.Addresses = addresses
 		}
 
 		if opts.Location != "" {
@@ -1785,20 +1879,45 @@ func (o *NB) UpdateLogicalSwitchPortOptions(ctx context.Context, portName OVNSwi
 	return nil
 }
 
-// LogicalSwitchPortSetDNS sets up the switch port DNS records for the DNS name.
+// UpdateLogicalSwitchPortDNS sets up the switch port DNS records for the DNS name.
 // Returns the DNS record UUID, IPv4 and IPv6 addresses used for DNS records.
-func (o *NB) LogicalSwitchPortSetDNS(switchName OVNSwitch, portName OVNSwitchPort, dnsName string, dnsIPs []net.IP) (OVNDNSUUID, error) {
-	// Check if existing DNS record exists for switch port.
-	dnsUUID, err := o.nbctl("--format=csv", "--no-headings", "--data=bare", "--colum=_uuid", "find", "dns",
-		fmt.Sprintf("external_ids:%s=%s", ovnExtIDIncusSwitchPort, portName),
-	)
+func (o *NB) UpdateLogicalSwitchPortDNS(ctx context.Context, switchName OVNSwitch, portName OVNSwitchPort, dnsName string, dnsIPs []net.IP) (OVNDNSUUID, error) {
+	// Get the logical switch.
+	ls, err := o.GetLogicalSwitch(ctx, switchName)
 	if err != nil {
 		return "", err
 	}
 
-	cmdArgs := []string{
-		fmt.Sprintf("external_ids:%s=%s", ovnExtIDIncusSwitch, switchName),
-		fmt.Sprintf("external_ids:%s=%s", ovnExtIDIncusSwitchPort, portName),
+	// Check if existing DNS record exists for switch port.
+	dnsRecords := []ovnNB.DNS{}
+
+	err = o.client.WhereCache(func(dnsRecord *ovnNB.DNS) bool {
+		return dnsRecord.ExternalIDs != nil && dnsRecord.ExternalIDs[ovnExtIDIncusSwitchPort] == string(portName)
+	}).List(ctx, &dnsRecords)
+	if err != nil {
+		return "", err
+	}
+
+	var dnsRecord ovnNB.DNS
+	if len(dnsRecords) == 1 {
+		dnsRecord = dnsRecords[0]
+	} else if len(dnsRecords) == 0 {
+		dnsRecord = ovnNB.DNS{}
+	} else {
+		return "", fmt.Errorf("Found more than one matching DNS record")
+	}
+
+	// Make sure the external IDs are set.
+	if dnsRecord.ExternalIDs == nil {
+		dnsRecord.ExternalIDs = map[string]string{}
+	}
+
+	dnsRecord.ExternalIDs[ovnExtIDIncusSwitch] = string(switchName)
+	dnsRecord.ExternalIDs[ovnExtIDIncusSwitchPort] = string(portName)
+
+	// Add the records.
+	if dnsRecord.Records == nil {
+		dnsRecord.Records = map[string]string{}
 	}
 
 	// Only include DNS name record if IPs supplied.
@@ -1812,159 +1931,161 @@ func (o *NB) LogicalSwitchPortSetDNS(switchName OVNSwitch, portName OVNSwitchPor
 			dnsIPsStr.WriteString(dnsIP.String())
 		}
 
-		cmdArgs = append(cmdArgs, fmt.Sprintf(`records={"%s"="%s"}`, strings.ToLower(dnsName), dnsIPsStr.String()))
-	}
-
-	dnsUUID = strings.TrimSpace(dnsUUID)
-	if dnsUUID != "" {
-		// Clear any existing DNS name if no IPs supplied.
-		if len(dnsIPs) < 1 {
-			cmdArgs = append(cmdArgs, "--", "clear", "dns", string(dnsUUID), "records")
-		}
-
-		// Update existing record if exists.
-		_, err = o.nbctl(append([]string{"set", "dns", dnsUUID}, cmdArgs...)...)
-		if err != nil {
-			return "", err
-		}
+		dnsRecord.Records[strings.ToLower(dnsName)] = dnsIPsStr.String()
 	} else {
-		// Create new record if needed.
-		dnsUUID, err = o.nbctl(append([]string{"create", "dns"}, cmdArgs...)...)
+		// Clear any existing DNS name if no IPs supplied.
+		dnsRecord.Records = map[string]string{}
+	}
+
+	operations := []ovsdb.Operation{}
+	if dnsRecord.UUID == "" {
+		// Create a new record.
+		dnsRecord.UUID = "record"
+
+		createOps, err := o.client.Create(&dnsRecord)
 		if err != nil {
 			return "", err
 		}
 
-		dnsUUID = strings.TrimSpace(dnsUUID)
+		operations = append(operations, createOps...)
+
+		// Add it to the logical switch.
+		updateOps, err := o.client.Where(ls).Mutate(ls, ovsModel.Mutation{
+			Field:   &ls.DNSRecords,
+			Mutator: ovsdb.MutateOperationInsert,
+			Value:   []string{dnsRecord.UUID},
+		})
+		if err != nil {
+			return "", err
+		}
+
+		operations = append(operations, updateOps...)
+	} else {
+		// Update the record.
+		updateOps, err := o.client.Where(&dnsRecord).Update(&dnsRecord)
+		if err != nil {
+			return "", err
+		}
+
+		operations = append(operations, updateOps...)
 	}
 
-	// Add DNS record to switch DNS records.
-	_, err = o.nbctl("add", "logical_switch", string(switchName), "dns_records", dnsUUID)
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
 	if err != nil {
 		return "", err
 	}
 
-	return OVNDNSUUID(dnsUUID), nil
+	_, err = ovsdb.CheckOperationResults(resp, operations)
+	if err != nil {
+		return "", err
+	}
+
+	if dnsRecord.UUID == "record" {
+		dnsRecord.UUID = resp[0].UUID.GoUUID
+	}
+
+	return OVNDNSUUID(dnsRecord.UUID), nil
 }
 
-// LogicalSwitchPortGetDNS returns the logical switch port DNS info (UUID, name and IPs).
-func (o *NB) LogicalSwitchPortGetDNS(portName OVNSwitchPort) (OVNDNSUUID, string, []net.IP, error) {
-	// Get UUID and DNS IPs for a switch port in the format: "<DNS UUID>,<DNS NAME>=<IP> <IP>"
-	output, err := o.nbctl("--format=csv", "--no-headings", "--data=bare", "--colum=_uuid,records", "find", "dns",
-		fmt.Sprintf("external_ids:%s=%s", ovnExtIDIncusSwitchPort, portName),
-	)
+// GetLogicalSwitchPortDNS returns the logical switch port DNS info (UUID, name and IPs).
+func (o *NB) GetLogicalSwitchPortDNS(ctx context.Context, portName OVNSwitchPort) (OVNDNSUUID, string, []net.IP, error) {
+	dnsRecords := []ovnNB.DNS{}
+
+	err := o.client.WhereCache(func(dnsRecord *ovnNB.DNS) bool {
+		return dnsRecord.ExternalIDs != nil && dnsRecord.ExternalIDs[ovnExtIDIncusSwitchPort] == string(portName)
+	}).List(ctx, &dnsRecords)
 	if err != nil {
 		return "", "", nil, err
 	}
 
-	parts := strings.Split(strings.TrimSpace(output), ",")
-	dnsUUID := strings.TrimSpace(parts[0])
+	if len(dnsRecords) != 1 {
+		return "", "", nil, nil
+	}
 
-	var dnsName string
+	if len(dnsRecords[0].Records) > 1 {
+		return "", "", nil, fmt.Errorf("More than one DNS record found for logical switch port")
+	}
+
 	var ips []net.IP
+	var dnsName string
 
-	// Try and parse the DNS name and IPs.
-	if len(parts) > 1 {
-		dnsParts := strings.SplitN(strings.TrimSpace(parts[1]), "=", 2)
-		if len(dnsParts) == 2 {
-			dnsName = strings.TrimSpace(dnsParts[0])
-			ipParts := strings.Split(dnsParts[1], " ")
-			for _, ipPart := range ipParts {
-				ip := net.ParseIP(strings.TrimSpace(ipPart))
-				if ip != nil {
-					ips = append(ips, ip)
-				}
+	for key, value := range dnsRecords[0].Records {
+		dnsName = key
+
+		for _, ipPart := range strings.Split(value, " ") {
+			ip := net.ParseIP(strings.TrimSpace(ipPart))
+			if ip != nil {
+				ips = append(ips, ip)
 			}
 		}
 	}
 
-	return OVNDNSUUID(dnsUUID), dnsName, ips, nil
+	return OVNDNSUUID(dnsRecords[0].UUID), dnsName, ips, nil
 }
 
-// logicalSwitchPortDeleteDNSAppendArgs adds the command arguments to remove DNS records from a switch port.
+// logicalSwitchPortDeleteDNSOperations returns a list of ovsdb operations to remove DNS records from a switch port.
 // If destroyEntry the DNS entry record itself is also removed, otherwise it is just cleared but left in place.
-// Returns args with the commands added to it.
-func (o *NB) logicalSwitchPortDeleteDNSAppendArgs(args []string, switchName OVNSwitch, dnsUUID OVNDNSUUID, destroyEntry bool) []string {
-	if len(args) > 0 {
-		args = append(args, "--")
-	}
-
-	args = append(args, "remove", "logical_switch", string(switchName), "dns_records", string(dnsUUID), "--")
-
-	if destroyEntry {
-		args = append(args, "destroy", "dns", string(dnsUUID))
-	} else {
-		args = append(args, "clear", "dns", string(dnsUUID), "records")
-	}
-
-	return args
-}
-
-// LogicalSwitchPortDeleteDNS removes DNS records from a switch port.
-// If destroyEntry the DNS entry record itself is also removed, otherwise it is just cleared but left in place.
-func (o *NB) LogicalSwitchPortDeleteDNS(switchName OVNSwitch, dnsUUID OVNDNSUUID, destroyEntry bool) error {
-	// Remove DNS record association from switch, and remove DNS record entry itself.
-	_, err := o.nbctl(o.logicalSwitchPortDeleteDNSAppendArgs(nil, switchName, dnsUUID, destroyEntry)...)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// logicalSwitchPortDeleteAppendArgs adds the commands to delete the specified logical switch port.
-// Returns args with the commands added to it.
-func (o *NB) logicalSwitchPortDeleteAppendArgs(args []string, portName OVNSwitchPort) []string {
-	if len(args) > 0 {
-		args = append(args, "--")
-	}
-
-	args = append(args, "--if-exists", "lsp-del", string(portName))
-
-	return args
-}
-
-// DeleteLogicalSwitchPort deletes a named logical switch port.
-func (o *NB) DeleteLogicalSwitchPort(ctx context.Context, switchName OVNSwitch, portName OVNSwitchPort) error {
+func (o *NB) logicalSwitchPortDeleteDNSOperations(ctx context.Context, switchName OVNSwitch, dnsUUID OVNDNSUUID, destroyEntry bool) ([]ovsdb.Operation, error) {
 	operations := []ovsdb.Operation{}
 
-	// Get the logical switch port.
-	logicalSwitchPort := ovnNB.LogicalSwitchPort{
-		Name: string(portName),
+	// Get the DNS entry.
+	dnsEntry := ovnNB.DNS{
+		UUID: string(dnsUUID),
 	}
 
-	err := o.get(ctx, &logicalSwitchPort)
+	err := o.get(ctx, &dnsEntry)
 	if err != nil {
-		// Logical switch port is already gone.
-		if err == ErrNotFound {
-			return nil
-		}
-
-		return err
+		return nil, err
 	}
 
-	// Remove the port from the switch.
-	logicalSwitch := ovnNB.LogicalSwitch{
-		Name: string(switchName),
+	// Get the logical switch.
+	ls, err := o.GetLogicalSwitch(ctx, switchName)
+	if err != nil {
+		return nil, err
 	}
 
-	updateOps, err := o.client.Where(&logicalSwitch).Mutate(&logicalSwitch, ovsModel.Mutation{
-		Field:   &logicalSwitch.Ports,
+	// Remove from the logical switch.
+	updateOps, err := o.client.Where(ls).Mutate(ls, ovsModel.Mutation{
+		Field:   &ls.DNSRecords,
 		Mutator: ovsdb.MutateOperationDelete,
-		Value:   []string{logicalSwitchPort.UUID},
+		Value:   []string{dnsEntry.UUID},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	operations = append(operations, updateOps...)
 
-	// Delete the port itself.
-	deleteOps, err := o.client.Where(&logicalSwitchPort).Delete()
+	if destroyEntry {
+		deleteOps, err := o.client.Where(&dnsEntry).Delete()
+		if err != nil {
+			return nil, err
+		}
+
+		operations = append(operations, deleteOps...)
+	} else {
+		dnsEntry.Records = nil
+
+		updateOps, err := o.client.Where(&dnsEntry).Update(&dnsEntry)
+		if err != nil {
+			return nil, err
+		}
+
+		operations = append(operations, updateOps...)
+	}
+
+	return operations, nil
+}
+
+// DeleteLogicalSwitchPortDNS removes DNS records from a switch port.
+// If destroyEntry the DNS entry record itself is also removed, otherwise it is just cleared but left in place.
+func (o *NB) DeleteLogicalSwitchPortDNS(ctx context.Context, switchName OVNSwitch, dnsUUID OVNDNSUUID, destroyEntry bool) error {
+	// Remove DNS record association from switch, and remove DNS record entry itself.
+	operations, err := o.logicalSwitchPortDeleteDNSOperations(ctx, switchName, dnsUUID, destroyEntry)
 	if err != nil {
 		return err
 	}
-
-	operations = append(operations, deleteOps...)
 
 	// Apply the changes.
 	resp, err := o.client.Transact(ctx, operations...)
@@ -1980,25 +2101,116 @@ func (o *NB) DeleteLogicalSwitchPort(ctx context.Context, switchName OVNSwitch, 
 	return nil
 }
 
-// LogicalSwitchPortCleanup deletes the named logical switch port and its associated config.
-func (o *NB) LogicalSwitchPortCleanup(portName OVNSwitchPort, switchName OVNSwitch, switchPortGroupName OVNPortGroup, dnsUUID OVNDNSUUID) error {
-	// Remove any existing rules assigned to the entity.
-	removeACLRuleUUIDs, err := o.logicalSwitchPortACLRules(context.TODO(), portName)
+// logicalSwitchPortDeleteAppendArgs adds the commands to delete the specified logical switch port.
+func (o *NB) logicalSwitchPortDeleteOperations(ctx context.Context, switchName OVNSwitch, portName OVNSwitchPort) ([]ovsdb.Operation, error) {
+	operations := []ovsdb.Operation{}
+
+	// Get the logical switch port.
+	logicalSwitchPort := ovnNB.LogicalSwitchPort{
+		Name: string(portName),
+	}
+
+	err := o.get(ctx, &logicalSwitchPort)
+	if err != nil {
+		// Logical switch port is already gone.
+		if err == ErrNotFound {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	// Remove the port from the switch.
+	logicalSwitch := ovnNB.LogicalSwitch{
+		Name: string(switchName),
+	}
+
+	updateOps, err := o.client.Where(&logicalSwitch).Mutate(&logicalSwitch, ovsModel.Mutation{
+		Field:   &logicalSwitch.Ports,
+		Mutator: ovsdb.MutateOperationDelete,
+		Value:   []string{logicalSwitchPort.UUID},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	operations = append(operations, updateOps...)
+
+	// Delete the port itself.
+	deleteOps, err := o.client.Where(&logicalSwitchPort).Delete()
+	if err != nil {
+		return nil, err
+	}
+
+	operations = append(operations, deleteOps...)
+
+	return operations, nil
+}
+
+// DeleteLogicalSwitchPort deletes a named logical switch port.
+func (o *NB) DeleteLogicalSwitchPort(ctx context.Context, switchName OVNSwitch, portName OVNSwitchPort) error {
+	// Get the delete operations.
+	operations, err := o.logicalSwitchPortDeleteOperations(ctx, switchName, portName)
 	if err != nil {
 		return err
 	}
 
-	args := o.aclRuleDeleteAppendArgs(nil, "port_group", string(switchPortGroupName), removeACLRuleUUIDs)
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// CleanupLogicalSwitchPort deletes the named logical switch port and its associated config.
+func (o *NB) CleanupLogicalSwitchPort(ctx context.Context, portName OVNSwitchPort, switchName OVNSwitch, switchPortGroupName OVNPortGroup, dnsUUID OVNDNSUUID) error {
+	operations := []ovsdb.Operation{}
+
+	// Remove any existing rules assigned to the entity.
+	removeACLRuleUUIDs, err := o.logicalSwitchPortACLRules(ctx, portName)
+	if err != nil {
+		return err
+	}
+
+	deleteOps, err := o.aclRuleDeleteOperations(ctx, "port_group", string(switchPortGroupName), removeACLRuleUUIDs)
+	if err != nil {
+		return err
+	}
+
+	operations = append(operations, deleteOps...)
 
 	// Remove logical switch port.
-	args = o.logicalSwitchPortDeleteAppendArgs(args, portName)
+	deleteOps, err = o.logicalSwitchPortDeleteOperations(ctx, switchName, portName)
+	if err != nil {
+		return err
+	}
+
+	operations = append(operations, deleteOps...)
 
 	// Remove DNS records.
 	if dnsUUID != "" {
-		args = o.logicalSwitchPortDeleteDNSAppendArgs(args, switchName, dnsUUID, false)
+		deleteOps, err := o.logicalSwitchPortDeleteDNSOperations(ctx, switchName, dnsUUID, false)
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, deleteOps...)
 	}
 
-	_, err = o.nbctl(args...)
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -2006,14 +2218,41 @@ func (o *NB) LogicalSwitchPortCleanup(portName OVNSwitchPort, switchName OVNSwit
 	return nil
 }
 
-// LogicalSwitchPortLinkRouter links a logical switch port to a logical router port.
-func (o *NB) LogicalSwitchPortLinkRouter(switchPortName OVNSwitchPort, routerPortName OVNRouterPort) error {
-	// Connect logical router port to switch.
-	_, err := o.nbctl(
-		"lsp-set-type", string(switchPortName), "router", "--",
-		"lsp-set-addresses", string(switchPortName), "router", "--",
-		"lsp-set-options", string(switchPortName), fmt.Sprintf("nat-addresses=%s", "router"), fmt.Sprintf("router-port=%s", string(routerPortName)),
-	)
+// UpdateLogicalSwitchPortLinkRouter links a logical switch port to a logical router port.
+func (o *NB) UpdateLogicalSwitchPortLinkRouter(ctx context.Context, switchPortName OVNSwitchPort, routerPortName OVNRouterPort) error {
+	// Get the logical switch port.
+	lsp := ovnNB.LogicalSwitchPort{
+		Name: string(switchPortName),
+	}
+
+	err := o.get(ctx, &lsp)
+	if err != nil {
+		return err
+	}
+
+	// Update the fields.
+	lsp.Type = "router"
+	lsp.Addresses = []string{"router"}
+	if lsp.Options == nil {
+		lsp.Options = map[string]string{}
+	}
+
+	lsp.Options["nat-addresses"] = "router"
+	lsp.Options["router-port"] = string(routerPortName)
+
+	// Update the record.
+	operations, err := o.client.Where(&lsp).Update(&lsp)
+	if err != nil {
+		return err
+	}
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -2021,14 +2260,40 @@ func (o *NB) LogicalSwitchPortLinkRouter(switchPortName OVNSwitchPort, routerPor
 	return nil
 }
 
-// LogicalSwitchPortLinkProviderNetwork links a logical switch port to a provider network.
-func (o *NB) LogicalSwitchPortLinkProviderNetwork(switchPortName OVNSwitchPort, extNetworkName string) error {
-	// Forward any unknown MAC frames down this port.
-	_, err := o.nbctl(
-		"lsp-set-addresses", string(switchPortName), "unknown", "--",
-		"lsp-set-type", string(switchPortName), "localnet", "--",
-		"lsp-set-options", string(switchPortName), fmt.Sprintf("network_name=%s", extNetworkName),
-	)
+// UpdateLogicalSwitchPortLinkProviderNetwork links a logical switch port to a provider network.
+func (o *NB) UpdateLogicalSwitchPortLinkProviderNetwork(ctx context.Context, switchPortName OVNSwitchPort, extNetworkName string) error {
+	// Get the logical switch port.
+	lsp := ovnNB.LogicalSwitchPort{
+		Name: string(switchPortName),
+	}
+
+	err := o.get(ctx, &lsp)
+	if err != nil {
+		return err
+	}
+
+	// Update the fields.
+	lsp.Type = "localnet"
+	lsp.Addresses = []string{"unknown"}
+	if lsp.Options == nil {
+		lsp.Options = map[string]string{}
+	}
+
+	lsp.Options["network_name"] = extNetworkName
+
+	// Update the record.
+	operations, err := o.client.Where(&lsp).Update(&lsp)
+	if err != nil {
+		return err
+	}
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -2358,31 +2623,60 @@ func (o *NB) GetPortGroupsByProject(ctx context.Context, projectID int64) ([]OVN
 	return pgNames, nil
 }
 
-// PortGroupMemberChange adds/removes logical switch ports (by UUID) to/from existing port groups.
-func (o *NB) PortGroupMemberChange(addMembers map[OVNPortGroup][]OVNSwitchPortUUID, removeMembers map[OVNPortGroup][]OVNSwitchPortUUID) error {
-	args := []string{}
+// UpdatePortGroupMembers adds/removes logical switch ports (by UUID) to/from existing port groups.
+func (o *NB) UpdatePortGroupMembers(ctx context.Context, addMembers map[OVNPortGroup][]OVNSwitchPortUUID, removeMembers map[OVNPortGroup][]OVNSwitchPortUUID) error {
+	operations := []ovsdb.Operation{}
 
 	for portGroupName, portMemberUUIDs := range addMembers {
-		for _, portMemberUUID := range portMemberUUIDs {
-			if len(args) > 0 {
-				args = append(args, "--")
+		pg := ovnNB.PortGroup{
+			Name: string(portGroupName),
+		}
+
+		for _, portUUID := range portMemberUUIDs {
+			updateOps, err := o.client.Where(&pg).Mutate(&pg, ovsModel.Mutation{
+				Field:   &pg.Ports,
+				Mutator: ovsdb.MutateOperationInsert,
+				Value:   []string{string(portUUID)},
+			})
+			if err != nil {
+				return err
 			}
 
-			args = append(args, "add", "port_group", string(portGroupName), "ports", string(portMemberUUID))
+			operations = append(operations, updateOps...)
 		}
 	}
 
 	for portGroupName, portMemberUUIDs := range removeMembers {
-		for _, portMemberUUID := range portMemberUUIDs {
-			if len(args) > 0 {
-				args = append(args, "--")
+		pg := ovnNB.PortGroup{
+			Name: string(portGroupName),
+		}
+
+		for _, portUUID := range portMemberUUIDs {
+			updateOps, err := o.client.Where(&pg).Mutate(&pg, ovsModel.Mutation{
+				Field:   &pg.Ports,
+				Mutator: ovsdb.MutateOperationDelete,
+				Value:   []string{string(portUUID)},
+			})
+			if err != nil {
+				return err
 			}
 
-			args = append(args, "--if-exists", "remove", "port_group", string(portGroupName), "ports", string(portMemberUUID))
+			operations = append(operations, updateOps...)
 		}
 	}
 
-	_, err := o.nbctl(args...)
+	// Check if anything changed.
+	if len(operations) == 0 {
+		return nil
+	}
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -2390,19 +2684,53 @@ func (o *NB) PortGroupMemberChange(addMembers map[OVNPortGroup][]OVNSwitchPortUU
 	return nil
 }
 
-// PortGroupSetACLRules applies a set of rules to the specified port group. Any existing rules are removed.
-func (o *NB) PortGroupSetACLRules(portGroupName OVNPortGroup, matchReplace map[string]string, aclRules ...OVNACLRule) error {
-	// Remove any existing rules assigned to the entity.
-	args := []string{"clear", "port_group", string(portGroupName), "acls"}
+// UpdatePortGroupACLRules applies a set of rules to the specified port group. Any existing rules are removed.
+func (o *NB) UpdatePortGroupACLRules(ctx context.Context, portGroupName OVNPortGroup, matchReplace map[string]string, aclRules ...OVNACLRule) error {
+	operations := []ovsdb.Operation{}
+
+	// Get the port group.
+	pg := ovnNB.PortGroup{
+		Name: string(portGroupName),
+	}
+
+	err := o.get(ctx, &pg)
+	if err != nil {
+		return err
+	}
+
+	// Remove any existing rules assigned to the port group.
+	for _, aclUUID := range pg.ACLs {
+		updateOps, err := o.client.Where(&pg).Mutate(&pg, ovsModel.Mutation{
+			Field:   &pg.ACLs,
+			Mutator: ovsdb.MutateOperationDelete,
+			Value:   []string{aclUUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
+	}
 
 	// Add new rules.
 	externalIDs := map[string]string{
 		ovnExtIDIncusPortGroup: string(portGroupName),
 	}
 
-	args = o.aclRuleAddAppendArgs(args, "port_group", string(portGroupName), externalIDs, matchReplace, aclRules...)
+	createOps, err := o.aclRuleAddOperations(ctx, "port_group", string(portGroupName), externalIDs, matchReplace, aclRules...)
+	if err != nil {
+		return err
+	}
 
-	_, err := o.nbctl(args...)
+	operations = append(operations, createOps...)
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -2410,70 +2738,164 @@ func (o *NB) PortGroupSetACLRules(portGroupName OVNPortGroup, matchReplace map[s
 	return nil
 }
 
-// aclRuleAddAppendArgs adds the commands to args that add the provided ACL rules to the specified OVN entity.
-// Returns args with the ACL rule add commands added to it.
-func (o *NB) aclRuleAddAppendArgs(args []string, entityTable string, entityName string, externalIDs map[string]string, matchReplace map[string]string, aclRules ...OVNACLRule) []string {
-	for i, rule := range aclRules {
-		if len(args) > 0 {
-			args = append(args, "--")
-		}
+// aclRuleAddOperations returns the operations to add the provided ACL rules to the specified OVN entity.
+func (o *NB) aclRuleAddOperations(ctx context.Context, entityTable string, entityName string, externalIDs map[string]string, matchReplace map[string]string, aclRules ...OVNACLRule) ([]ovsdb.Operation, error) {
+	operations := []ovsdb.Operation{}
 
+	for i, rule := range aclRules {
 		// Perform any replacements requested on the Match string.
 		for find, replace := range matchReplace {
 			rule.Match = strings.ReplaceAll(rule.Match, find, replace)
 		}
 
-		// Add command to create ACL rule.
-		args = append(args, fmt.Sprintf("--id=@id%d", i), "create", "acl",
-			fmt.Sprintf("action=%s", rule.Action),
-			fmt.Sprintf("direction=%s", rule.Direction),
-			fmt.Sprintf("priority=%d", rule.Priority),
-			fmt.Sprintf("match=%s", strconv.Quote(rule.Match)),
-		)
+		// Add new ACL.
+		acl := ovnNB.ACL{
+			UUID:        fmt.Sprintf("acl%d", i),
+			Action:      rule.Action,
+			Direction:   rule.Direction,
+			Priority:    rule.Priority,
+			Match:       rule.Match,
+			ExternalIDs: map[string]string{},
+		}
 
 		if rule.Log {
-			args = append(args, "log=true")
+			acl.Log = true
 
 			if rule.LogName != "" {
-				args = append(args, fmt.Sprintf("name=%s", rule.LogName))
+				logName := rule.LogName
+				acl.Name = &logName
 			}
 		}
 
 		for k, v := range externalIDs {
-			args = append(args, fmt.Sprintf("external_ids:%s=%s", k, v))
+			acl.ExternalIDs[k] = v
 		}
 
-		// Add command to assign ACL rule to entity.
-		args = append(args, "--", "add", entityTable, entityName, "acl", fmt.Sprintf("@id%d", i))
+		createOps, err := o.client.Create(&acl)
+		if err != nil {
+			return nil, err
+		}
+
+		operations = append(operations, createOps...)
+
+		// Add ACL rule to entity.
+		if entityTable == "logical_switch" {
+			ls := ovnNB.LogicalSwitch{
+				Name: entityName,
+			}
+
+			updateOps, err := o.client.Where(&ls).Mutate(&ls, ovsModel.Mutation{
+				Field:   &ls.ACLs,
+				Mutator: ovsdb.MutateOperationInsert,
+				Value:   []string{acl.UUID},
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			operations = append(operations, updateOps...)
+		} else if entityTable == "port_group" {
+			pg := ovnNB.PortGroup{
+				Name: entityName,
+			}
+
+			updateOps, err := o.client.Where(&pg).Mutate(&pg, ovsModel.Mutation{
+				Field:   &pg.ACLs,
+				Mutator: ovsdb.MutateOperationInsert,
+				Value:   []string{acl.UUID},
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			operations = append(operations, updateOps...)
+		} else {
+			return nil, fmt.Errorf("Unsupported entity table %q", entityTable)
+		}
 	}
 
-	return args
+	return operations, nil
 }
 
-// aclRuleDeleteAppendArgs adds the commands to args that delete the provided ACL rules from the specified OVN entity.
-// Returns args with the ACL rule delete commands added to it.
-func (o *NB) aclRuleDeleteAppendArgs(args []string, entityTable string, entityName string, aclRuleUUIDs []string) []string {
+// aclRuleDeleteOperations returns the operations that delete the provided ACL rules from the specified OVN entity.
+func (o *NB) aclRuleDeleteOperations(ctx context.Context, entityTable string, entityName string, aclRuleUUIDs []string) ([]ovsdb.Operation, error) {
+	operations := []ovsdb.Operation{}
+
 	for _, aclRuleUUID := range aclRuleUUIDs {
-		if len(args) > 0 {
-			args = append(args, "--")
+		// Get the ACL.
+		acl := ovnNB.ACL{
+			UUID: aclRuleUUID,
 		}
 
-		args = append(args, "remove", entityTable, string(entityName), "acl", aclRuleUUID)
+		err := o.get(ctx, &acl)
+		if err != nil {
+			return nil, err
+		}
+
+		// Delete the ACL.
+		deleteOps, err := o.client.Where(&acl).Delete()
+		if err != nil {
+			return nil, err
+		}
+
+		operations = append(operations, deleteOps...)
+
+		// Remove ACL rule from entity.
+		if entityTable == "logical_switch" {
+			ls := ovnNB.LogicalSwitch{
+				Name: entityName,
+			}
+
+			updateOps, err := o.client.Where(&ls).Mutate(&ls, ovsModel.Mutation{
+				Field:   &ls.ACLs,
+				Mutator: ovsdb.MutateOperationDelete,
+				Value:   []string{acl.UUID},
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			operations = append(operations, updateOps...)
+		} else if entityTable == "port_group" {
+			pg := ovnNB.PortGroup{
+				Name: entityName,
+			}
+
+			updateOps, err := o.client.Where(&pg).Mutate(&pg, ovsModel.Mutation{
+				Field:   &pg.ACLs,
+				Mutator: ovsdb.MutateOperationDelete,
+				Value:   []string{acl.UUID},
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			operations = append(operations, updateOps...)
+		} else {
+			return nil, fmt.Errorf("Unsupported entity table %q", entityTable)
+		}
 	}
 
-	return args
+	return operations, nil
 }
 
-// PortGroupPortSetACLRules applies a set of rules for the logical switch port in the specified port group.
+// UpdatePortGroupPortACLRules applies a set of rules for the logical switch port in the specified port group.
 // Any existing rules for that logical switch port in the port group are removed.
-func (o *NB) PortGroupPortSetACLRules(portGroupName OVNPortGroup, portName OVNSwitchPort, aclRules ...OVNACLRule) error {
+func (o *NB) UpdatePortGroupPortACLRules(ctx context.Context, portGroupName OVNPortGroup, portName OVNSwitchPort, aclRules ...OVNACLRule) error {
+	operations := []ovsdb.Operation{}
+
 	// Remove any existing rules assigned to the entity.
-	removeACLRuleUUIDs, err := o.logicalSwitchPortACLRules(context.TODO(), portName)
+	removeACLRuleUUIDs, err := o.logicalSwitchPortACLRules(ctx, portName)
 	if err != nil {
 		return err
 	}
 
-	args := o.aclRuleDeleteAppendArgs(nil, "port_group", string(portGroupName), removeACLRuleUUIDs)
+	deleteOps, err := o.aclRuleDeleteOperations(ctx, "port_group", string(portGroupName), removeACLRuleUUIDs)
+	if err != nil {
+		return err
+	}
+
+	operations = append(operations, deleteOps...)
 
 	// Add new rules.
 	externalIDs := map[string]string{
@@ -2481,9 +2903,20 @@ func (o *NB) PortGroupPortSetACLRules(portGroupName OVNPortGroup, portName OVNSw
 		ovnExtIDIncusSwitchPort: string(portName),
 	}
 
-	args = o.aclRuleAddAppendArgs(args, "port_group", string(portGroupName), externalIDs, nil, aclRules...)
+	createOps, err := o.aclRuleAddOperations(ctx, "port_group", string(portGroupName), externalIDs, nil, aclRules...)
+	if err != nil {
+		return err
+	}
 
-	_, err = o.nbctl(args...)
+	operations = append(operations, createOps...)
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -2491,34 +2924,39 @@ func (o *NB) PortGroupPortSetACLRules(portGroupName OVNPortGroup, portName OVNSw
 	return nil
 }
 
-// PortGroupPortClearACLRules clears any rules assigned to the logical switch port in the specified port group.
-func (o *NB) PortGroupPortClearACLRules(portGroupName OVNPortGroup, portName OVNSwitchPort) error {
+// ClearPortGroupPortACLRules clears any rules assigned to the logical switch port in the specified port group.
+func (o *NB) ClearPortGroupPortACLRules(ctx context.Context, portGroupName OVNPortGroup, portName OVNSwitchPort) error {
 	// Remove any existing rules assigned to the entity.
-	removeACLRuleUUIDs, err := o.logicalSwitchPortACLRules(context.TODO(), portName)
+	removeACLRuleUUIDs, err := o.logicalSwitchPortACLRules(ctx, portName)
 	if err != nil {
 		return err
 	}
 
-	args := o.aclRuleDeleteAppendArgs(nil, "port_group", string(portGroupName), removeACLRuleUUIDs)
+	operations, err := o.aclRuleDeleteOperations(ctx, "port_group", string(portGroupName), removeACLRuleUUIDs)
+	if err != nil {
+		return err
+	}
 
-	if len(args) > 0 {
-		_, err = o.nbctl(args...)
-		if err != nil {
-			return err
-		}
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 
-// LoadBalancerApply creates a new load balancer (if doesn't exist) on the specified routers and switches.
+// CreateLoadBalancer creates a new load balancer (if doesn't exist) on the specified router and switch.
 // Providing an empty set of vips will delete the load balancer.
-func (o *NB) LoadBalancerApply(loadBalancerName OVNLoadBalancer, routers []OVNRouter, switches []OVNSwitch, vips ...OVNLoadBalancerVIP) error {
+func (o *NB) CreateLoadBalancer(ctx context.Context, loadBalancerName OVNLoadBalancer, routerName OVNRouter, switchName OVNSwitch, vips ...OVNLoadBalancerVIP) error {
 	lbTCPName := fmt.Sprintf("%s-tcp", loadBalancerName)
 	lbUDPName := fmt.Sprintf("%s-udp", loadBalancerName)
-
-	// Remove existing load balancers if they exist.
-	args := []string{"--if-exists", "lb-del", lbTCPName, "--", "lb-del", lbUDPName}
+	operations := []ovsdb.Operation{}
 
 	// ipToString wraps IPv6 addresses in square brackets.
 	ipToString := func(ip net.IP) string {
@@ -2529,8 +2967,53 @@ func (o *NB) LoadBalancerApply(loadBalancerName OVNLoadBalancer, routers []OVNRo
 		return ip.String()
 	}
 
-	// We have to use a separate load balancer for UDP rules so use this to keep track of whether we need it.
-	lbNames := make(map[string]struct{})
+	// Remove existing load balancers if they exist.
+	for _, name := range []string{lbTCPName, lbUDPName} {
+		lb := ovnNB.LoadBalancer{
+			Name: name,
+		}
+
+		err := o.get(ctx, &lb)
+		if err == nil {
+			// Delete the load balancer.
+			deleteOps, err := o.client.Where(&lb).Delete()
+			if err != nil {
+				return err
+			}
+
+			operations = append(operations, deleteOps...)
+		} else if err != ErrNotFound {
+			return err
+		}
+	}
+
+	// Get the logical router.
+	lr, err := o.GetLogicalRouter(ctx, routerName)
+	if err != nil {
+		return err
+	}
+
+	// Get the logical switch.
+	ls, err := o.GetLogicalSwitch(ctx, switchName)
+	if err != nil {
+		return err
+	}
+
+	// Define the new load-balancers.
+	lbtcp := &ovnNB.LoadBalancer{
+		UUID:     "lbtcp",
+		Name:     lbTCPName,
+		Protocol: &ovnNB.LoadBalancerProtocolTCP,
+	}
+
+	lbudp := &ovnNB.LoadBalancer{
+		UUID:     "lbudp",
+		Name:     lbUDPName,
+		Protocol: &ovnNB.LoadBalancerProtocolUDP,
+	}
+
+	// Keep track of health check settings.
+	healthChecks := map[string]*OVNLoadBalancerHealthCheck{}
 
 	// Build up the commands to add VIPs to the load balancer.
 	for _, r := range vips {
@@ -2542,70 +3025,228 @@ func (o *NB) LoadBalancerApply(loadBalancerName OVNLoadBalancer, routers []OVNRo
 			return fmt.Errorf("Missing VIP target(s)")
 		}
 
-		if r.Protocol == "udp" {
-			args = append(args, "--", "lb-add", lbUDPName)
-			lbNames[lbUDPName] = struct{}{} // Record that UDP load balancer is created.
-		} else {
-			args = append(args, "--", "lb-add", lbTCPName)
-			lbNames[lbTCPName] = struct{}{} // Record that TCP load balancer is created.
-		}
-
-		targetArgs := make([]string, 0, len(r.Targets))
-
-		for _, target := range r.Targets {
-			if (r.ListenPort > 0 && target.Port <= 0) || (target.Port > 0 && r.ListenPort <= 0) {
-				return fmt.Errorf("The listen and target ports must be specified together")
+		for _, lb := range []*ovnNB.LoadBalancer{lbtcp, lbudp} {
+			if r.Protocol != "" && r.Protocol != *lb.Protocol {
+				continue
 			}
 
+			if lb.Vips == nil {
+				lb.Vips = map[string]string{}
+			}
+
+			targetAddresses := []string{}
+			for _, target := range r.Targets {
+				if (r.ListenPort > 0 && target.Port <= 0) || (target.Port > 0 && r.ListenPort <= 0) {
+					return fmt.Errorf("The listen and target ports must be specified together")
+				}
+
+				// Determine the target address.
+				var targetAddress string
+				if r.ListenPort > 0 {
+					targetAddress = fmt.Sprintf("%s:%d", ipToString(target.Address), target.Port)
+				} else {
+					targetAddress = ipToString(target.Address)
+				}
+
+				targetAddresses = append(targetAddresses, targetAddress)
+			}
+
+			// Determine the listen address.
+			var listenAddress string
 			if r.ListenPort > 0 {
-				targetArgs = append(targetArgs, fmt.Sprintf("%s:%d", ipToString(target.Address), target.Port))
+				listenAddress = fmt.Sprintf("%s:%d", ipToString(r.ListenAddress), r.ListenPort)
 			} else {
-				targetArgs = append(targetArgs, ipToString(target.Address))
-			}
-		}
-
-		if r.ListenPort > 0 {
-			args = append(args,
-				fmt.Sprintf("%s:%d", ipToString(r.ListenAddress), r.ListenPort),
-				strings.Join(targetArgs, ","),
-				r.Protocol,
-			)
-		} else {
-			args = append(args,
-				ipToString(r.ListenAddress),
-				strings.Join(targetArgs, ","),
-			)
-		}
-	}
-
-	// If there are some VIP rules then associate the load balancer to the requested routers and switches.
-	if len(vips) > 0 {
-		for _, r := range routers {
-			_, found := lbNames[lbTCPName]
-			if found {
-				args = append(args, "--", "lr-lb-add", string(r), lbTCPName)
+				listenAddress = ipToString(r.ListenAddress)
 			}
 
-			_, found = lbNames[lbUDPName]
-			if found {
-				args = append(args, "--", "lr-lb-add", string(r), lbUDPName)
-			}
-		}
+			lb.Vips[listenAddress] = strings.Join(targetAddresses, ",")
 
-		for _, s := range switches {
-			_, found := lbNames[lbTCPName]
-			if found {
-				args = append(args, "--", "ls-lb-add", string(s), lbTCPName)
-			}
-
-			_, found = lbNames[lbUDPName]
-			if found {
-				args = append(args, "--", "ls-lb-add", string(s), lbUDPName)
+			if r.HealthCheck != nil {
+				healthChecks[listenAddress] = r.HealthCheck
 			}
 		}
 	}
 
-	_, err := o.nbctl(args...)
+	// Create any used load-balancer.
+	lbhcCount := 0
+	for _, lb := range []*ovnNB.LoadBalancer{lbtcp, lbudp} {
+		if len(lb.Vips) == 0 {
+			continue
+		}
+
+		// Create healthcheck records.
+		lb.HealthCheck = []string{}
+		lb.IPPortMappings = map[string]string{}
+
+		for vip, targets := range lb.Vips {
+			// Check if an health check exists for the VIP.
+			healthCheck := healthChecks[vip]
+			if healthCheck == nil {
+				continue
+			}
+
+			// Create the record.
+			lbhc := &ovnNB.LoadBalancerHealthCheck{
+				UUID:    fmt.Sprintf("lbhc%d", lbhcCount),
+				Options: map[string]string{},
+				Vip:     vip,
+			}
+
+			// Set some defaults.
+			if healthCheck.FailureCount == 0 {
+				healthCheck.FailureCount = 3
+			}
+
+			if healthCheck.SuccessCount == 0 {
+				healthCheck.SuccessCount = 3
+			}
+
+			if healthCheck.Interval == 0 {
+				healthCheck.Interval = 10
+			}
+
+			if healthCheck.Timeout == 0 {
+				healthCheck.Timeout = 30
+			}
+
+			// Apply the settings.
+			lbhc.Options = map[string]string{
+				"failure_count": fmt.Sprintf("%d", healthCheck.FailureCount),
+				"success_count": fmt.Sprintf("%d", healthCheck.SuccessCount),
+				"interval":      fmt.Sprintf("%d", healthCheck.Interval),
+				"timeout":       fmt.Sprintf("%d", healthCheck.Timeout),
+			}
+
+			// Create the load balancer health checker.
+			createOps, err := o.client.Create(lbhc)
+			if err != nil {
+				return err
+			}
+
+			operations = append(operations, createOps...)
+
+			// Link LB to LBHC.
+			lb.HealthCheck = append(lb.HealthCheck, lbhc.UUID)
+
+			// Set up the port bindings.
+			for _, target := range strings.Split(targets, ",") {
+				// Split host and port.
+				host, _, err := net.SplitHostPort(target)
+				if err == nil {
+					target = host
+				}
+
+				// Skip existing entries.
+				_, ok := lb.IPPortMappings[target]
+				if ok {
+					continue
+				}
+
+				// Lookup the logical switch port.
+				var lspName string
+				for _, port := range ls.Ports {
+					lsp := ovnNB.LogicalSwitchPort{
+						UUID: port,
+					}
+
+					err = o.get(ctx, &lsp)
+					if err != nil {
+						return err
+					}
+
+					if lsp.ExternalIDs == nil {
+						continue
+					}
+
+					if OVNSwitch(lsp.ExternalIDs[ovnExtIDIncusSwitch]) != switchName {
+						continue
+					}
+
+					if lsp.DynamicAddresses != nil {
+						fields := strings.Split(*lsp.DynamicAddresses, " ")
+						if slices.Contains(fields, target) {
+							lspName = lsp.Name
+							break
+						}
+					}
+
+					for _, address := range lsp.Addresses {
+						fields := strings.Split(address, " ")
+						if slices.Contains(fields, target) {
+							lspName = lsp.Name
+							break
+						}
+					}
+				}
+
+				if lspName == "" {
+					return fmt.Errorf("Couldn't find a logical switch port for %q", target)
+				}
+
+				ip := net.ParseIP(target)
+				if ip.To4() == nil {
+					if healthCheck.CheckerIPV6 == nil {
+						return fmt.Errorf("No IPv6 address for load balancer health check")
+					}
+
+					lb.IPPortMappings[fmt.Sprintf("[%s]", target)] = fmt.Sprintf("%s:[%s]", lspName, healthCheck.CheckerIPV6.String())
+				} else {
+					if healthCheck.CheckerIPV4 == nil {
+						return fmt.Errorf("No IPv4 address for load balancer health check")
+					}
+
+					lb.IPPortMappings[target] = fmt.Sprintf("%s:%s", lspName, healthCheck.CheckerIPV4.String())
+				}
+			}
+
+			lbhcCount++
+		}
+
+		// Create the record.
+		createOps, err := o.client.Create(lb)
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, createOps...)
+
+		// Add to the router.
+		updateOps, err := o.client.Where(lr).Mutate(lr, ovsModel.Mutation{
+			Field:   &lr.LoadBalancer,
+			Mutator: ovsdb.MutateOperationInsert,
+			Value:   []string{lb.UUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
+
+		// Add to the switch.
+		updateOps, err = o.client.Where(ls).Mutate(ls, ovsModel.Mutation{
+			Field:   &ls.LoadBalancer,
+			Mutator: ovsdb.MutateOperationInsert,
+			Value:   []string{lb.UUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
+	}
+
+	// Check if anything to delete.
+	if len(operations) == 0 {
+		return nil
+	}
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -2964,15 +3605,85 @@ func (o *NB) DeleteAddressSet(ctx context.Context, addressSetPrefix OVNAddressSe
 	return nil
 }
 
-// LogicalRouterPolicyApply removes any existing policies and applies the new policies to the specified router.
-func (o *NB) LogicalRouterPolicyApply(routerName OVNRouter, policies ...OVNRouterPolicy) error {
-	args := []string{"lr-policy-del", string(routerName)}
+// UpdateLogicalRouterPolicy removes any existing policies and applies the new policies to the specified router.
+func (o *NB) UpdateLogicalRouterPolicy(ctx context.Context, routerName OVNRouter, policies ...OVNRouterPolicy) error {
+	operations := []ovsdb.Operation{}
 
-	for _, policy := range policies {
-		args = append(args, "--", "lr-policy-add", string(routerName), fmt.Sprintf("%d", policy.Priority), policy.Match, policy.Action)
+	// Get the logical router.
+	lr, err := o.GetLogicalRouter(ctx, routerName)
+	if err != nil {
+		return err
 	}
 
-	_, err := o.nbctl(args...)
+	// Clear the existing policies.
+	for _, policyUUID := range lr.Policies {
+		// Delete the policy.
+		policy := ovnNB.LogicalRouterPolicy{
+			UUID: policyUUID,
+		}
+
+		deleteOps, err := o.client.Where(&policy).Delete()
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, deleteOps...)
+
+		// Remove from the logical router.
+		updateOps, err := o.client.Where(lr).Mutate(lr, ovsModel.Mutation{
+			Field:   &lr.Policies,
+			Mutator: ovsdb.MutateOperationDelete,
+			Value:   []string{policy.UUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
+	}
+
+	// Add the new policies.
+	for i, routerPolicy := range policies {
+		// Create the policy.
+		policy := ovnNB.LogicalRouterPolicy{
+			UUID:     fmt.Sprintf("policy%d", i),
+			Priority: routerPolicy.Priority,
+			Match:    routerPolicy.Match,
+			Action:   routerPolicy.Action,
+		}
+
+		createOps, err := o.client.Create(&policy)
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, createOps...)
+
+		// Add to the logical router.
+		updateOps, err := o.client.Where(lr).Mutate(lr, ovsModel.Mutation{
+			Field:   &lr.Policies,
+			Mutator: ovsdb.MutateOperationInsert,
+			Value:   []string{policy.UUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
+	}
+
+	// Check if anything changed.
+	if len(operations) == 0 {
+		return nil
+	}
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
 	if err != nil {
 		return err
 	}
@@ -2980,100 +3691,93 @@ func (o *NB) LogicalRouterPolicyApply(routerName OVNRouter, policies ...OVNRoute
 	return nil
 }
 
-// LogicalRouterRoutes returns a list of static routes in the main route table of the logical router.
-func (o *NB) LogicalRouterRoutes(routerName OVNRouter) ([]OVNRouterRoute, error) {
-	output, err := o.nbctl("lr-route-list", string(routerName))
+// GetLogicalRouterRoutes returns a list of static routes in the main route table of the logical router.
+func (o *NB) GetLogicalRouterRoutes(ctx context.Context, routerName OVNRouter) ([]OVNRouterRoute, error) {
+	// Get the logical router.
+	lr, err := o.GetLogicalRouter(ctx, routerName)
 	if err != nil {
 		return nil, err
 	}
 
-	lines := util.SplitNTrimSpace(strings.TrimSpace(output), "\n", -1, true)
-	routes := make([]OVNRouterRoute, 0)
-
-	mainTable := true // Assume output starts with main table (supports ovn versions without multiple tables).
-	for i, line := range lines {
-		if line == "IPv4 Routes" || line == "IPv6 Routes" {
-			continue // Ignore heading category lines.
+	// Get all the routes.
+	routes := []OVNRouterRoute{}
+	for _, routeUUID := range lr.StaticRoutes {
+		// Get the static entry.
+		route := ovnNB.LogicalRouterStaticRoute{
+			UUID: routeUUID,
 		}
 
-		// Keep track of which route table we are looking at.
-		if strings.HasPrefix(line, "Route Table") {
-			if line == "Route Table <main>:" {
-				mainTable = true
-			} else {
-				mainTable = false
-			}
+		err = o.get(ctx, &route)
+		if err != nil {
+			return nil, err
+		}
 
+		// Only use the main table.
+		if route.RouteTable != "" {
 			continue
 		}
 
-		if !mainTable {
-			continue // We don't currently consider routes in other route tables.
-		}
+		// Create the route entry.
+		var routerRoute OVNRouterRoute
 
-		// E.g. "10.97.31.0/24 10.97.31.1 dst-ip [optional-some-router-port-name]"
-		fields := strings.Fields(line)
-		fieldsLen := len(fields)
-
-		if fieldsLen <= 0 {
-			continue // Ignore empty lines.
-		} else if fieldsLen < 3 || fieldsLen > 4 {
-			return nil, fmt.Errorf("Unrecognised static route item output on line %d: %q", i, line)
-		}
-
-		var route OVNRouterRoute
-
-		// ovn-nbctl doesn't output single-host route prefixes in CIDR format, so do the conversion here.
-		ip := net.ParseIP(fields[0])
+		// Add CIDR if missing.
+		ip := net.ParseIP(route.IPPrefix)
 		if ip != nil {
 			subnetSize := 32
 			if ip.To4() == nil {
 				subnetSize = 128
 			}
 
-			fields[0] = fmt.Sprintf("%s/%d", ip.String(), subnetSize)
+			route.IPPrefix = fmt.Sprintf("%s/%d", ip.String(), subnetSize)
 		}
 
-		_, prefix, err := net.ParseCIDR(fields[0])
+		_, prefix, err := net.ParseCIDR(route.IPPrefix)
 		if err != nil {
-			return nil, fmt.Errorf("Invalid static route prefix on line %d: %q", i, fields[0])
+			return nil, fmt.Errorf("Invalid static route prefix %q", route.IPPrefix)
 		}
 
-		route.Prefix = *prefix
-		route.NextHop = net.ParseIP(fields[1])
+		routerRoute.Prefix = *prefix
+		routerRoute.NextHop = net.ParseIP(route.Nexthop)
 
-		if fieldsLen > 3 {
-			route.Port = OVNRouterPort(fields[3])
+		if route.OutputPort != nil {
+			routerRoute.Port = OVNRouterPort(*route.OutputPort)
 		}
 
-		routes = append(routes, route)
+		routes = append(routes, routerRoute)
 	}
 
 	return routes, nil
 }
 
-// LogicalRouterPeeringApply applies a peering relationship between two logical routers.
-func (o *NB) LogicalRouterPeeringApply(opts OVNRouterPeering) error {
+// CreateLogicalRouterPeering applies a peering relationship between two logical routers.
+func (o *NB) CreateLogicalRouterPeering(ctx context.Context, opts OVNRouterPeering) error {
+	operations := []ovsdb.Operation{}
+
 	if len(opts.LocalRouterPortIPs) <= 0 || len(opts.TargetRouterPortIPs) <= 0 {
 		return fmt.Errorf("IPs not populated for both router ports")
 	}
 
 	// Remove peering router ports and static routes using ports from both routers.
 	// Run the delete step as a separate command to workaround a bug in OVN.
-	err := o.LogicalRouterPeeringDelete(opts)
+	err := o.DeleteLogicalRouterPeering(ctx, opts)
 	if err != nil {
 		return err
 	}
-
-	// Start fresh command set.
-	var args []string
 
 	// Will use the first IP from each family of the router port interfaces.
 	localRouterGatewayIPs := make(map[uint]net.IP, 0)
 	targetRouterGatewayIPs := make(map[uint]net.IP, 0)
 
-	// Setup local router port peered with target router port.
-	args = append(args, "--", "lrp-add", string(opts.LocalRouter), string(opts.LocalRouterPort), opts.LocalRouterPortMAC.String())
+	// Create the local router port.
+	localPeerName := string(opts.TargetRouterPort)
+	localLRP := ovnNB.LogicalRouterPort{
+		UUID:     "locallrp",
+		Name:     string(opts.LocalRouterPort),
+		MAC:      opts.LocalRouterPortMAC.String(),
+		Networks: []string{},
+		Peer:     &localPeerName,
+	}
+
 	for _, ipNet := range opts.LocalRouterPortIPs {
 		ipVersion := uint(4)
 		if ipNet.IP.To4() == nil {
@@ -3084,13 +3788,42 @@ func (o *NB) LogicalRouterPeeringApply(opts OVNRouterPeering) error {
 			localRouterGatewayIPs[ipVersion] = ipNet.IP
 		}
 
-		args = append(args, ipNet.String())
+		localLRP.Networks = append(localLRP.Networks, ipNet.String())
 	}
 
-	args = append(args, fmt.Sprintf("peer=%s", opts.TargetRouterPort))
+	createOps, err := o.client.Create(&localLRP)
+	if err != nil {
+		return err
+	}
 
-	// Setup target router port peered with local router port.
-	args = append(args, "--", "lrp-add", string(opts.TargetRouter), string(opts.TargetRouterPort), opts.TargetRouterPortMAC.String())
+	operations = append(operations, createOps...)
+
+	// And connect it to the router.
+	localRouter := ovnNB.LogicalRouter{
+		Name: string(opts.LocalRouter),
+	}
+
+	updateOps, err := o.client.Where(&localRouter).Mutate(&localRouter, ovsModel.Mutation{
+		Field:   &localRouter.Ports,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{localLRP.UUID},
+	})
+	if err != nil {
+		return err
+	}
+
+	operations = append(operations, updateOps...)
+
+	// Create the target router port.
+	targetPeerName := string(opts.LocalRouterPort)
+	targetLRP := ovnNB.LogicalRouterPort{
+		UUID:     "targetlrp",
+		Name:     string(opts.TargetRouterPort),
+		MAC:      opts.TargetRouterPortMAC.String(),
+		Networks: []string{},
+		Peer:     &targetPeerName,
+	}
+
 	for _, ipNet := range opts.TargetRouterPortIPs {
 		ipVersion := uint(4)
 		if ipNet.IP.To4() == nil {
@@ -3101,13 +3834,36 @@ func (o *NB) LogicalRouterPeeringApply(opts OVNRouterPeering) error {
 			targetRouterGatewayIPs[ipVersion] = ipNet.IP
 		}
 
-		args = append(args, ipNet.String())
+		targetLRP.Networks = append(targetLRP.Networks, ipNet.String())
 	}
 
-	args = append(args, fmt.Sprintf("peer=%s", opts.LocalRouterPort))
+	createOps, err = o.client.Create(&targetLRP)
+	if err != nil {
+		return err
+	}
+
+	operations = append(operations, createOps...)
+
+	// And connect it to the router.
+	targetRouter := ovnNB.LogicalRouter{
+		Name: string(opts.TargetRouter),
+	}
+
+	updateOps, err = o.client.Where(&targetRouter).Mutate(&targetRouter, ovsModel.Mutation{
+		Field:   &targetRouter.Ports,
+		Mutator: ovsdb.MutateOperationInsert,
+		Value:   []string{targetLRP.UUID},
+	})
+	if err != nil {
+		return err
+	}
+
+	operations = append(operations, updateOps...)
 
 	// Add routes using the first router gateway IP for each family for next hop address.
-	for _, route := range opts.LocalRouterRoutes {
+	localOutputPort := string(opts.LocalRouterPort)
+	for i, route := range opts.LocalRouterRoutes {
+		// Determine the nexthop.
 		ipVersion := uint(4)
 		if route.IP.To4() == nil {
 			ipVersion = 6
@@ -3119,10 +3875,37 @@ func (o *NB) LogicalRouterPeeringApply(opts OVNRouterPeering) error {
 			return fmt.Errorf("Missing target router port IPv%d address for local route %q nexthop address", ipVersion, route.String())
 		}
 
-		args = append(args, "--", "--may-exist", "lr-route-add", string(opts.LocalRouter), route.String(), nextHopIP.String(), string(opts.LocalRouterPort))
+		// Prepare the record.
+		route := ovnNB.LogicalRouterStaticRoute{
+			UUID:       fmt.Sprintf("local%d", i),
+			IPPrefix:   route.String(),
+			Nexthop:    nextHopIP.String(),
+			OutputPort: &localOutputPort,
+		}
+
+		createOps, err := o.client.Create(&route)
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, createOps...)
+
+		// Add it to the router.
+		updateOps, err := o.client.Where(&localRouter).Mutate(&localRouter, ovsModel.Mutation{
+			Field:   &localRouter.StaticRoutes,
+			Mutator: ovsdb.MutateOperationInsert,
+			Value:   []string{route.UUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
 	}
 
-	for _, route := range opts.TargetRouterRoutes {
+	targetOutputPort := string(opts.TargetRouterPort)
+	for i, route := range opts.TargetRouterRoutes {
+		// Determine the nexthop.
 		ipVersion := uint(4)
 		if route.IP.To4() == nil {
 			ipVersion = 6
@@ -3134,60 +3917,170 @@ func (o *NB) LogicalRouterPeeringApply(opts OVNRouterPeering) error {
 			return fmt.Errorf("Missing local router port IPv%d address for target route %q nexthop address", ipVersion, route.String())
 		}
 
-		args = append(args, "--", "--may-exist", "lr-route-add", string(opts.TargetRouter), route.String(), nextHopIP.String(), string(opts.TargetRouterPort))
-	}
+		// Prepare the record.
+		route := ovnNB.LogicalRouterStaticRoute{
+			UUID:       fmt.Sprintf("target%d", i),
+			IPPrefix:   route.String(),
+			Nexthop:    nextHopIP.String(),
+			OutputPort: &targetOutputPort,
+		}
 
-	if len(args) > 0 {
-		_, err := o.nbctl(args...)
+		createOps, err := o.client.Create(&route)
 		if err != nil {
 			return err
 		}
+
+		operations = append(operations, createOps...)
+
+		// Add it to the router.
+		updateOps, err := o.client.Where(&targetRouter).Mutate(&targetRouter, ovsModel.Mutation{
+			Field:   &targetRouter.StaticRoutes,
+			Mutator: ovsdb.MutateOperationInsert,
+			Value:   []string{route.UUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
+	}
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 
-// LogicalRouterPeeringDelete deletes a peering relationship between two logical routers.
+// DeleteLogicalRouterPeering deletes a peering relationship between two logical routers.
 // Requires LocalRouter, LocalRouterPort, TargetRouter and TargetRouterPort opts fields to be populated.
-func (o *NB) LogicalRouterPeeringDelete(opts OVNRouterPeering) error {
+func (o *NB) DeleteLogicalRouterPeering(ctx context.Context, opts OVNRouterPeering) error {
+	operations := []ovsdb.Operation{}
+
 	// Remove peering router ports and static routes using ports from both routers.
 	if opts.LocalRouter == "" || opts.TargetRouter == "" {
 		return fmt.Errorf("Router names not populated for both routers")
 	}
 
-	args := []string{
-		"--if-exists", "lrp-del", string(opts.LocalRouterPort), "--",
-		"--if-exists", "lrp-del", string(opts.TargetRouterPort),
-	}
-
-	// Remove static routes from both routers that use the respective peering router ports.
-	staticRoutes, err := o.LogicalRouterRoutes(opts.LocalRouter)
-	if err != nil {
-		return fmt.Errorf("Failed getting static routes for local peer router %q: %w", opts.LocalRouter, err)
-	}
-
-	for _, staticRoute := range staticRoutes {
-		if staticRoute.Port == opts.LocalRouterPort {
-			args = append(args, "--", "lr-route-del", string(opts.LocalRouter), staticRoute.Prefix.String(), staticRoute.NextHop.String(), string(opts.LocalRouterPort))
+	deleteLogicalRouterPort := func(routerName OVNRouter, portName OVNRouterPort) error {
+		// Get the logical router port.
+		logicalRouterPort := ovnNB.LogicalRouterPort{
+			Name: string(portName),
 		}
-	}
 
-	staticRoutes, err = o.LogicalRouterRoutes(opts.TargetRouter)
-	if err != nil {
-		return fmt.Errorf("Failed getting static routes for target peer router %q: %w", opts.TargetRouter, err)
-	}
+		err := o.get(ctx, &logicalRouterPort)
+		if err != nil {
+			if err == ErrNotFound {
+				// Logical router port is already gone.
+				return nil
+			}
 
-	for _, staticRoute := range staticRoutes {
-		if staticRoute.Port == opts.TargetRouterPort {
-			args = append(args, "--", "lr-route-del", string(opts.TargetRouter), staticRoute.Prefix.String(), staticRoute.NextHop.String(), string(opts.TargetRouterPort))
+			return err
 		}
-	}
 
-	if len(args) > 0 {
-		_, err := o.nbctl(args...)
+		// Get the logical router.
+		logicalRouter := ovnNB.LogicalRouter{
+			Name: string(routerName),
+		}
+
+		err = o.get(ctx, &logicalRouter)
 		if err != nil {
 			return err
 		}
+
+		// Remove the port from the router.
+		updateOps, err := o.client.Where(&logicalRouter).Mutate(&logicalRouter, ovsModel.Mutation{
+			Field:   &logicalRouter.Ports,
+			Mutator: ovsdb.MutateOperationDelete,
+			Value:   []string{logicalRouterPort.UUID},
+		})
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, updateOps...)
+
+		// Delete the port itself.
+		deleteOps, err := o.client.Where(&logicalRouterPort).Delete()
+		if err != nil {
+			return err
+		}
+
+		operations = append(operations, deleteOps...)
+
+		// Remove any associated route entries.
+		for _, routeUUID := range logicalRouter.StaticRoutes {
+			// Get the static entry.
+			route := ovnNB.LogicalRouterStaticRoute{
+				UUID: routeUUID,
+			}
+
+			err = o.get(ctx, &route)
+			if err != nil {
+				return err
+			}
+
+			// Skip over anything that's not tied to the current port.
+			if route.OutputPort != nil || *route.OutputPort != string(portName) {
+				continue
+			}
+
+			// Remove the route from the router.
+			updateOps, err := o.client.Where(&logicalRouter).Mutate(&logicalRouter, ovsModel.Mutation{
+				Field:   &logicalRouter.StaticRoutes,
+				Mutator: ovsdb.MutateOperationDelete,
+				Value:   []string{route.UUID},
+			})
+			if err != nil {
+				return err
+			}
+
+			operations = append(operations, updateOps...)
+
+			// Delete the route itself.
+			deleteOps, err := o.client.Where(&route).Delete()
+			if err != nil {
+				return err
+			}
+
+			operations = append(operations, deleteOps...)
+		}
+
+		return nil
+	}
+
+	// Delete both source and target router ports.
+	err := deleteLogicalRouterPort(opts.LocalRouter, opts.LocalRouterPort)
+	if err != nil {
+		return err
+	}
+
+	err = deleteLogicalRouterPort(opts.TargetRouter, opts.TargetRouterPort)
+	if err != nil {
+		return err
+	}
+
+	// Check if anything changed.
+	if len(operations) == 0 {
+		return nil
+	}
+
+	// Apply the changes.
+	resp, err := o.client.Transact(ctx, operations...)
+	if err != nil {
+		return err
+	}
+
+	_, err = ovsdb.CheckOperationResults(resp, operations)
+	if err != nil {
+		return err
 	}
 
 	return nil

@@ -21,6 +21,33 @@
 				]
 			}
 		},
+		"cluster_group": {
+			"common": {
+				"keys": [
+					{
+						"instances.vm.cpu.ARCHITECTURE.baseline": {
+							"longdesc": "The CPU base architecture name as can be found through `qemu -cpu ?`.\n\nThis can be a generic definition like `qemu64` or `kvm64`, or it can be a specific hardware architecture like `EPYC-v2`.\nIt's important to ensure that all servers in the group match that baseline.",
+							"shortdesc": "CPU base architecture name",
+							"type": "string"
+						}
+					},
+					{
+						"instances.vm.cpu.ARCHITECTURE.flags": {
+							"longdesc": "A comma separated list of CPU flags to add on top of CPU baseline or a list of flags to remove from it.\n\nTo remove a flag, use `-flag`.",
+							"shortdesc": "CPU flags to add/remove to/from the baseline",
+							"type": "string"
+						}
+					},
+					{
+						"user.*": {
+							"longdesc": "User keys can be used in search.",
+							"shortdesc": "Free form user key/value storage",
+							"type": "string"
+						}
+					}
+				]
+			}
+		},
 		"devices": {
 			"disk": {
 				"keys": [
@@ -60,19 +87,19 @@
 					},
 					{
 						"io.bus": {
-							"default": "`virtio-scsi`",
-							"longdesc": "",
+							"default": "`virtio-scsi` for block, `auto` for file system",
+							"longdesc": "This controls what bus a disk device should be attached to.\n\nFor block devices (disks), this is one of:\n- `nvme`\n- `virtio-blk`\n- `virtio-scsi` (default)\n\nFor file systems (shared directories or custom volumes), this is one of:\n- `9p`\n- `auto` (default) (`virtiofs` + `9p`, just `9p` if `virtiofsd` is missing)\n- `virtiofs`",
 							"required": "no",
-							"shortdesc": "Only for VMs: Override the bus for the device (`nvme`, `virtio-blk`, or `virtio-scsi`)",
+							"shortdesc": "Only for VMs: Override the bus for the device",
 							"type": "string"
 						}
 					},
 					{
 						"io.cache": {
 							"default": "`none`",
-							"longdesc": "",
+							"longdesc": "This controls what bus a disk device should be attached to.\n\nFor block devices (disks), this is one of:\n- `none` (default)\n- `writeback`\n- `unsafe`\n\nFor file systems (shared directories or custom volumes), this is one of:\n- `none` (default)\n- `metadata`\n- `unsafe`",
 							"required": "no",
-							"shortdesc": "Only for VMs: Override the caching mode for the device (`none`, `writeback` or `unsafe`)",
+							"shortdesc": "Only for VMs: Override the caching mode for the device",
 							"type": "string"
 						}
 					},
@@ -427,6 +454,14 @@
 			"boot": {
 				"keys": [
 					{
+						"boot.autorestart": {
+							"liveupdate": "no",
+							"longdesc": "If set to `true` will attempt up to 10 restarts over a 1 minute period upon unexpected instance exit.",
+							"shortdesc": "Whether to automatically restart an instance on unexpected exit",
+							"type": "bool"
+						}
+					},
+					{
 						"boot.autostart": {
 							"liveupdate": "no",
 							"longdesc": "If set to `false`, restore the last state.",
@@ -456,9 +491,9 @@
 						"boot.host_shutdown_action": {
 							"defaultdesc": "stop",
 							"liveupdate": "yes",
-							"longdesc": "Action to take on host shut down",
+							"longdesc": "Action to take on host shut down\n\nValid values are: `stop`, `force-stop` or `stateful-stop`",
 							"shortdesc": "What action to take on the instance when the host is shut down",
-							"type": "integer"
+							"type": "string"
 						}
 					},
 					{
@@ -726,6 +761,42 @@
 						}
 					},
 					{
+						"raw.qemu.qmp.early": {
+							"condition": "virtual machine",
+							"liveupdate": "no",
+							"longdesc": "",
+							"shortdesc": "QMP commands to run before Incus QEMU initialization",
+							"type": "blob"
+						}
+					},
+					{
+						"raw.qemu.qmp.post-start": {
+							"condition": "virtual machine",
+							"liveupdate": "no",
+							"longdesc": "",
+							"shortdesc": "QMP commands to run after the VM has started",
+							"type": "blob"
+						}
+					},
+					{
+						"raw.qemu.qmp.pre-start": {
+							"condition": "virtual machine",
+							"liveupdate": "no",
+							"longdesc": "",
+							"shortdesc": "QMP commands to run after Incus QEMU initialization and before the VM has started",
+							"type": "blob"
+						}
+					},
+					{
+						"raw.qemu.scriptlet": {
+							"condition": "virtual machine",
+							"liveupdate": "no",
+							"longdesc": "",
+							"shortdesc": "QEMU scriptlet to run at early, pre-start and post-start stages",
+							"type": "string"
+						}
+					},
+					{
 						"raw.seccomp": {
 							"condition": "container",
 							"liveupdate": "no",
@@ -822,7 +893,7 @@
 					},
 					{
 						"limits.memory": {
-							"defaultdesc": "`1Gib` (VMs)",
+							"defaultdesc": "`1GiB` (VMs)",
 							"liveupdate": "yes",
 							"longdesc": "Percentage of the host's memory or a fixed value in bytes.\nVarious suffixes are supported.\n\nSee {ref}`instances-limit-units` for details.",
 							"shortdesc": "Usage limit for the host's memory",
@@ -1200,7 +1271,7 @@
 						"snapshots.schedule": {
 							"defaultdesc": "empty",
 							"liveupdate": "no",
-							"longdesc": "Specify either a cron expression (`\u003cminute\u003e \u003chour\u003e \u003cdom\u003e \u003cmonth\u003e \u003cdow\u003e`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots.\n",
+							"longdesc": "Specify either a cron expression (`\u003cminute\u003e \u003chour\u003e \u003cdom\u003e \u003cmonth\u003e \u003cdow\u003e`), a comma-and-space-separated list of schedule aliases (`@startup`, `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots.\n\nNote that unlike most other configuration keys, this one must be comma-and-space-separated and not just comma-separated as cron expression can themselves contain commas.\n",
 							"shortdesc": "Schedule for automatic instance snapshots",
 							"type": "string"
 						}
@@ -1405,6 +1476,14 @@
 							"longdesc": "The cluster group(s) that the instance was restricted to at creation time.\nThis is used during re-scheduling events like an evacuation to keep the instance within the requested set.",
 							"shortdesc": "The original cluster group for the instance",
 							"type": "string"
+						}
+					},
+					{
+						"volatile.container.oci": {
+							"defaultdesc": "`false`",
+							"longdesc": "",
+							"shortdesc": "Whether the container is an OCI application container",
+							"type": "bool"
 						}
 					},
 					{
@@ -1645,9 +1724,62 @@
 					},
 					{
 						"ovn.transit.pattern": {
-							"defaultdesc": "`ts-incus-{{ integrationName }}-{{ projectName }}-{{ networkname }}`",
-							"longdesc": "Specify a Pongo2 template string that represents the transit switch name.\nThis template gets access to the project name (`projectName`), integration name (`integrationName`) and network name (`networkName`).\n",
+							"defaultdesc": "`ts-incus-{{ integrationName }}-{{ projectName }}-{{ networkName }}`",
+							"longdesc": "Specify a Pongo2 template string that represents the transit switch name.\nThis template gets access to the project name (`projectName`),\nintegration name (`integrationName`), network name (`networkName`)\nand peer name (`peerName`).\n",
 							"shortdesc": "Template for the transit switch name",
+							"type": "string"
+						}
+					}
+				]
+			}
+		},
+		"network_load_balancer": {
+			"common": {
+				"keys": [
+					{
+						"healthcheck": {
+							"defaultdesc": "`false`",
+							"longdesc": "",
+							"shortdesc": "Whether to perform checks on the backends",
+							"type": "bool"
+						}
+					},
+					{
+						"healthcheck.failure_count": {
+							"defaultdesc": "`3`",
+							"longdesc": "",
+							"shortdesc": "Number of failed tests to consider the backend offline",
+							"type": "integer"
+						}
+					},
+					{
+						"healthcheck.interval": {
+							"defaultdesc": "`10`",
+							"longdesc": "",
+							"shortdesc": "Interval in seconds between health checks",
+							"type": "integer"
+						}
+					},
+					{
+						"healthcheck.success_count": {
+							"defaultdesc": "`3`",
+							"longdesc": "",
+							"shortdesc": "Number of successful tests to consider the backend online",
+							"type": "integer"
+						}
+					},
+					{
+						"healthcheck.timeout": {
+							"defaultdesc": "`30`",
+							"longdesc": "",
+							"shortdesc": "Test timeout",
+							"type": "integer"
+						}
+					},
+					{
+						"user.*": {
+							"longdesc": "User keys can be used in search.",
+							"shortdesc": "Free form user key/value storage",
 							"type": "string"
 						}
 					}
@@ -1780,6 +1912,13 @@
 						"limits.disk": {
 							"longdesc": "This value is the maximum value of the aggregate disk space used by all instance volumes, custom volumes, and images of the project.",
 							"shortdesc": "Maximum disk space used by the project",
+							"type": "string"
+						}
+					},
+					{
+						"limits.disk.pool.POOL_NAME": {
+							"longdesc": "This value is the maximum value of the aggregate disk\nspace used by all instance volumes, custom volumes, and images of the\nproject on this specific storage pool.",
+							"shortdesc": "Maximum disk space used by the project on this pool",
 							"type": "string"
 						}
 					},
@@ -2508,6 +2647,15 @@
 						}
 					},
 					{
+						"instances.lxcfs.per_instance": {
+							"defaultdesc": "`false`",
+							"longdesc": "LXCFS is used to provide overlays for common `/proc` and `/sys`\nfiles which reflect the resource limits applied to the container.\n\nIt normally operates through a single file system mount on the host which is then shared by all containers.\nThis is very efficient but comes with the downside that a crash of LXCFS will break all containers.\n\nWith this option, it's now possible to run a LXCFS instance per\ncontainer instead, using more system resources but reducing the impact\nof a crash.",
+							"scope": "global",
+							"shortdesc": "Whether to run LXCFS on a per-instance basis",
+							"type": "bool"
+						}
+					},
+					{
 						"instances.nic.host_name": {
 							"defaultdesc": "`random`",
 							"longdesc": "Possible values are `random` and `mac`.\n\nIf set to `random`, use the random host interface name as the host name.\nIf set to `mac`, generate a host name in the form `inc\u003cmac_address\u003e` (MAC without leading two digits).",
@@ -2562,10 +2710,19 @@
 					},
 					{
 						"network.ovn.northbound_connection": {
-							"defaultdesc": "`unix:/var/run/ovn/ovnnb_db.sock`",
+							"defaultdesc": "`unix:/run/ovn/ovnnb_db.sock`",
 							"longdesc": "",
 							"scope": "global",
 							"shortdesc": "OVN northbound database connection string",
+							"type": "string"
+						}
+					},
+					{
+						"network.ovs.connection": {
+							"defaultdesc": "`unix:/run/openvswitch/db.sock`",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "OVS socket path",
 							"type": "string"
 						}
 					},
@@ -2618,6 +2775,14 @@
 							"longdesc": "",
 							"scope": "global",
 							"shortdesc": "OpenID Connect Discovery URL for the provider",
+							"type": "string"
+						}
+					},
+					{
+						"oidc.scopes": {
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "Comma separated list of OpenID Connect scopes",
 							"type": "string"
 						}
 					}

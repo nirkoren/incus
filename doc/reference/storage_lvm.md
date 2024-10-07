@@ -54,7 +54,6 @@ To use this with Incus, you must:
 - Enable `lvmlockd` by setting `use_lvmlockd = 1` in your `/etc/lvm/lvm.conf`
 - Set a unique (within your cluster) `host_id` value in `/etc/lvm/lvmlocal.conf`
 - Ensure that both `lvmlockd` and `sanlock` daemons are running
-- Create a shared VG and confirm it is accessible on all servers
 
 ## Configuration options
 
@@ -67,6 +66,7 @@ Key                          | Type   | Driver       | Default                  
 :--                          | :---   | :-----       | :------                                               | :----------
 `lvm.thinpool_name`          | string | `lvm`        | `IncusThinPool`                                       | Thin pool where volumes are created
 `lvm.thinpool_metadata_size` | string | `lvm`        |`0` (auto)                                             | The size of the thin pool metadata volume (the default is to let LVM calculate an appropriate size)
+`lvm.metadata_size`          | string | `lvm`        |`0` (auto)                                             | The size of the metadata space for the physical volume
 `lvm.use_thinpool`           | bool   | `lvm`        | `true`                                                | Whether the storage pool uses a thin pool for logical volumes
 `lvm.vg.force_reuse`         | bool   | `lvm`        | `false`                                               | Force using an existing non-empty volume group
 `lvm.vg_name`                | string | all          | name of the pool                                      | Name of the volume group to create

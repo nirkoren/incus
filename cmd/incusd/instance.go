@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	ociSpecs "github.com/opencontainers/runtime-spec/specs-go"
 
 	internalInstance "github.com/lxc/incus/v6/internal/instance"
 	"github.com/lxc/incus/v6/internal/revert"
@@ -33,12 +37,12 @@ import (
 // Helper functions
 
 // instanceCreateAsEmpty creates an empty instance.
-func instanceCreateAsEmpty(s *state.State, args db.InstanceArgs) (instance.Instance, error) {
+func instanceCreateAsEmpty(s *state.State, args db.InstanceArgs, op *operations.Operation) (instance.Instance, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
 	// Create the instance record.
-	inst, instOp, cleanup, err := instance.CreateInternal(s, args, true, true)
+	inst, instOp, cleanup, err := instance.CreateInternal(s, args, op, true, true)
 	if err != nil {
 		return nil, fmt.Errorf("Failed creating instance record: %w", err)
 	}
@@ -154,7 +158,7 @@ func instanceCreateFromImage(ctx context.Context, s *state.State, r *http.Reques
 	args.BaseImage = img.Fingerprint
 
 	// Create the instance.
-	inst, instOp, cleanup, err := instance.CreateInternal(s, args, true, true)
+	inst, instOp, cleanup, err := instance.CreateInternal(s, args, op, true, true)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance record: %w", err)
 	}
@@ -182,6 +186,58 @@ func instanceCreateFromImage(ctx context.Context, s *state.State, r *http.Reques
 	err = pool.CreateInstanceFromImage(inst, img.Fingerprint, op)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance from image: %w", err)
+	}
+
+	// If dealing with an OCI image, parse the configuration.
+	if args.Type == instancetype.Container && inst.LocalConfig()["image.type"] == "oci" {
+		// Reset the config to the post-generation one.
+		args.Config = inst.LocalConfig()
+
+		// Mount the instance.
+		_, err = pool.MountInstance(inst, nil)
+		if err != nil {
+			return err
+		}
+
+		// Parse the OCI config.
+		data, err := os.ReadFile(filepath.Join(inst.Path(), "config.json"))
+		if err != nil {
+			return err
+		}
+
+		var config ociSpecs.Spec
+		err = json.Unmarshal([]byte(data), &config)
+		if err != nil {
+			return err
+		}
+
+		// Unmount the instance.
+		err = pool.UnmountInstance(inst, nil)
+		if err != nil {
+			return err
+		}
+
+		// Update the config for the environment variables.
+		args.Config["volatile.container.oci"] = "true"
+		for _, env := range config.Process.Env {
+			fields := strings.SplitN(env, "=", 2)
+			if len(fields) != 2 {
+				return fmt.Errorf("Bad OCI environment variable: %s", env)
+			}
+
+			key := fmt.Sprintf("environment.%s", fields[0])
+			value := fields[1]
+
+			_, ok := args.Config[key]
+			if !ok {
+				args.Config[key] = value
+			}
+		}
+
+		err = inst.Update(args, false)
+		if err != nil {
+			return err
+		}
 	}
 
 	revert.Add(func() { _ = inst.Delete(true) })
@@ -259,7 +315,7 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 	// If we are not in refresh mode, then create a new instance as we are in copy mode.
 	if !opts.refresh {
 		// Create the instance.
-		inst, instOp, cleanup, err = instance.CreateInternal(s, opts.targetInstance, true, false)
+		inst, instOp, cleanup, err = instance.CreateInternal(s, opts.targetInstance, op, true, false)
 		if err != nil {
 			return nil, fmt.Errorf("Failed creating instance record: %w", err)
 		}
@@ -394,7 +450,7 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 			}
 
 			// Create the snapshots.
-			_, snapInstOp, cleanup, err := instance.CreateInternal(s, snapInstArgs, true, false)
+			_, snapInstOp, cleanup, err := instance.CreateInternal(s, snapInstArgs, op, true, false)
 			if err != nil {
 				return nil, fmt.Errorf("Failed creating instance snapshot record %q: %w", newSnapName, err)
 			}

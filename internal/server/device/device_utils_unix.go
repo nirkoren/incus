@@ -1,7 +1,9 @@
 package device
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -266,7 +268,7 @@ func unixDeviceSetup(s *state.State, devicesPath string, typePrefix string, devi
 	// Load all existing host devices.
 	dents, err := os.ReadDir(devicesPath)
 	if err != nil {
-		if !os.IsNotExist(err) {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
@@ -278,7 +280,7 @@ func unixDeviceSetup(s *state.State, devicesPath string, typePrefix string, devi
 		// Remove the device type and name prefix, leaving just the encoded dest path.
 		idx := strings.LastIndex(devName, ".")
 		if idx == -1 {
-			return fmt.Errorf("Invalid device name \"%s\"", devName)
+			continue
 		}
 
 		encRelDestFile := devName[idx+1:]
@@ -384,7 +386,7 @@ func unixDeviceRemove(devicesPath string, typePrefix string, deviceName string, 
 	// Load all devices.
 	dents, err := os.ReadDir(devicesPath)
 	if err != nil {
-		if !os.IsNotExist(err) {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
@@ -422,7 +424,7 @@ func unixDeviceRemove(devicesPath string, typePrefix string, deviceName string, 
 		// Remove the device type and name prefix, leaving just the encoded dest path.
 		idx := strings.LastIndex(otherDev, ".")
 		if idx == -1 {
-			return fmt.Errorf("Invalid device name \"%s\"", otherDev)
+			continue
 		}
 
 		encRelDestFile := otherDev[idx+1:]
@@ -490,7 +492,7 @@ func unixDeviceDeleteFiles(s *state.State, devicesPath string, typePrefix string
 	// Load all devices.
 	dents, err := os.ReadDir(devicesPath)
 	if err != nil {
-		if !os.IsNotExist(err) {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}

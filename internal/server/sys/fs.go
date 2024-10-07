@@ -3,7 +3,9 @@
 package sys
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -42,6 +44,7 @@ func (s *OS) initDirs() error {
 
 		{filepath.Join(s.VarDir, "backups"), 0700},
 		{s.CacheDir, 0700},
+		{filepath.Join(s.CacheDir, "resources"), 0700},
 		{filepath.Join(s.VarDir, "database"), 0700},
 		{filepath.Join(s.VarDir, "devices"), 0711},
 		{filepath.Join(s.VarDir, "disks"), 0700},
@@ -49,7 +52,7 @@ func (s *OS) initDirs() error {
 		{filepath.Join(s.VarDir, "images"), 0700},
 		{s.LogDir, 0700},
 		{filepath.Join(s.VarDir, "networks"), 0711},
-		{s.RunDir, 0700},
+		{s.RunDir, 0711},
 		{filepath.Join(s.VarDir, "security"), 0700},
 		{filepath.Join(s.VarDir, "security", "apparmor"), 0700},
 		{filepath.Join(s.VarDir, "security", "apparmor", "cache"), 0700},
@@ -67,7 +70,7 @@ func (s *OS) initDirs() error {
 			}
 
 			err = os.Chmod(dir.path, dir.mode)
-			if err != nil && !os.IsNotExist(err) {
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return fmt.Errorf("Failed to chmod dir %q: %w", dir.path, err)
 			}
 		}
@@ -94,7 +97,7 @@ func (s *OS) initStorageDirs() error {
 			}
 
 			err = os.Chmod(dir.path, dir.mode)
-			if err != nil && !os.IsNotExist(err) {
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return fmt.Errorf("Failed to chmod storage dir %q: %w", dir.path, err)
 			}
 		}

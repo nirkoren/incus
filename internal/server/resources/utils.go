@@ -2,9 +2,12 @@ package resources
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -205,7 +208,7 @@ func getDeviceDir(devicePath string) (string, error) {
 	for {
 		deviceDir := filepath.Join(devicePath, "device")
 		fileInfo, err := os.Stat(deviceDir)
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			break
 		} else if err != nil {
 			return "", fmt.Errorf("Unable to get file info for %q: %w", deviceDir, err)
@@ -217,4 +220,15 @@ func getDeviceDir(devicePath string) (string, error) {
 	}
 
 	return devicePath, nil
+}
+
+func sortedMapKeys[M ~map[int64]V, V any](m M) []int64 {
+	r := make([]int64, 0, len(m))
+	for k := range m {
+		r = append(r, k)
+	}
+
+	sort.Slice(r, func(i, j int) bool { return r[i] < r[j] })
+
+	return r
 }

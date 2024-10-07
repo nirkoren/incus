@@ -16,6 +16,7 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   capability setgid,
   capability setuid,
   capability sys_chroot,
+  capability sys_rawio,
   capability sys_resource,
 
   # Needed by qemu
@@ -27,9 +28,11 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   /dev/vfio/**                              rw,
   /dev/vhost-net                            rw,
   /dev/vhost-vsock                          rw,
-  /etc/ceph/**                              r,
   /etc/machine-id                           r,
   /run/udev/data/*                          r,
+  @{PROC}/sys/vm/max_map_count              r,
+  @{PROC}/@{pid}/cpuset                     r,
+  @{PROC}/@{pid}/task/*/comm                rw,
   /sys/bus/                                 r,
   /sys/bus/nd/devices/                      r,
   /sys/bus/usb/devices/                     r,
@@ -38,19 +41,25 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   /sys/devices/**                           r,
   /sys/module/vhost/**                      r,
   /tmp/incus_sev_*                          r,
-  {{ .ovmfPath }}/**                        kr,
+{{- range $index, $element := .edk2Paths }}
+  {{ $element }}/**                         kr,
+{{- end }}
   /usr/share/qemu/**                        kr,
   /usr/share/seabios/**                     kr,
-  owner @{PROC}/@{pid}/cpuset               r,
-  owner @{PROC}/@{pid}/task/@{tid}/comm     rw,
   /etc/nsswitch.conf         r,
   /etc/passwd                r,
   /etc/group                 r,
   @{PROC}/version                           r,
 
+  # Extra config paths
+{{- range $index, $element := .extra_config }}
+  {{ $element }}/**                         kr,
+{{- end }}
+
+
   # Extra binaries
 {{- range $index, $element := .extra_binaries }}
-{{ $element }}                               mrix,
+  {{ $element }}                            mrix,
 {{- end }}
 
   # Used by qemu for live migration NBD server and client

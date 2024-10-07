@@ -1,7 +1,9 @@
 package apparmor
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -58,6 +60,9 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   /run/systemd/resolve/stub-resolv.conf r,
   /run/{resolvconf,NetworkManager,systemd/resolve,connman,netconfig}/resolv.conf r,
   /usr/lib/systemd/resolv.conf r,
+
+  # Allow /dev/shm access (for Wayland)
+  /dev/shm/** rwkl,
 
   # Needed for the fork sub-commands
   {{ .exePath }} mr,
@@ -167,7 +172,7 @@ func ForkproxyLoad(sysOS *sys.OS, inst instance, dev device) error {
 	 */
 	profile := filepath.Join(aaPath, "profiles", forkproxyProfileFilename(inst, dev))
 	content, err := os.ReadFile(profile)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 

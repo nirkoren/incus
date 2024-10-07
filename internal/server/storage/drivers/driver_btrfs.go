@@ -1,7 +1,9 @@
 package drivers
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -101,6 +103,7 @@ func (d *btrfs) Info() Info {
 		PreservesInodes:              !d.state.OS.RunningInUserNS,
 		Remote:                       d.isRemote(),
 		VolumeTypes:                  []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeMultiNode:              d.isRemote(),
 		BlockBacking:                 false,
 		RunningCopyFreeze:            false,
 		DirectIO:                     true,
@@ -192,6 +195,8 @@ func (d *btrfs) Create() error {
 		}
 
 		// Confirm that the symlink is appearing (give it 10s).
+		// In case of timeout it falls back to using the volume's path
+		// instead of its UUID.
 		if tryExists(fmt.Sprintf("/dev/disk/by-uuid/%s", devUUID)) {
 			// Override the config to use the UUID.
 			d.config["source"] = devUUID
@@ -233,7 +238,7 @@ func (d *btrfs) Create() error {
 
 				// Delete the current directory to replace by subvolume.
 				err := os.Remove(cleanSource)
-				if err != nil && !os.IsNotExist(err) {
+				if err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return fmt.Errorf("Failed to remove %q: %w", cleanSource, err)
 				}
 			}
@@ -308,7 +313,7 @@ func (d *btrfs) Delete(op *operations.Operation) error {
 	// Delete any loop file we may have used.
 	loopPath := loopFilePath(d.name)
 	err = os.Remove(loopPath)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("Failed removing loop file %q: %w", loopPath, err)
 	}
 

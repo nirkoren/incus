@@ -182,6 +182,11 @@ func (c *Config) InstancesPlacementScriptlet() string {
 	return c.m.GetString("instances.placement.scriptlet")
 }
 
+// InstancesLXCFSPerInstance returns whether LXCFS should be run on a per-instance basis.
+func (c *Config) InstancesLXCFSPerInstance() bool {
+	return c.m.GetBool("instances.lxcfs.per_instance")
+}
+
 // LokiServer returns all the Loki settings needed to connect to a server.
 func (c *Config) LokiServer() (string, string, string, string, string, string, []string, []string) {
 	var types []string
@@ -214,8 +219,8 @@ func (c *Config) RemoteTokenExpiry() string {
 }
 
 // OIDCServer returns all the OpenID Connect settings needed to connect to a server.
-func (c *Config) OIDCServer() (string, string, string, string) {
-	return c.m.GetString("oidc.issuer"), c.m.GetString("oidc.client.id"), c.m.GetString("oidc.audience"), c.m.GetString("oidc.claim")
+func (c *Config) OIDCServer() (string, string, string, string, string) {
+	return c.m.GetString("oidc.issuer"), c.m.GetString("oidc.client.id"), c.m.GetString("oidc.scopes"), c.m.GetString("oidc.audience"), c.m.GetString("oidc.claim")
 }
 
 // ClusterHealingThreshold returns the configured healing threshold, i.e. the
@@ -540,6 +545,23 @@ var ConfigSchema = config.Schema{
 	//  shortdesc: When an unused cached remote image is flushed
 	"images.remote_cache_expiry": {Type: config.Int64, Default: "10"},
 
+	// gendoc:generate(entity=server, group=miscellaneous, key=instances.lxcfs.per_instance)
+	// LXCFS is used to provide overlays for common `/proc` and `/sys`
+	// files which reflect the resource limits applied to the container.
+	//
+	// It normally operates through a single file system mount on the host which is then shared by all containers.
+	// This is very efficient but comes with the downside that a crash of LXCFS will break all containers.
+	//
+	// With this option, it's now possible to run a LXCFS instance per
+	// container instead, using more system resources but reducing the impact
+	// of a crash.
+	// ---
+	//  type: bool
+	//  scope: global
+	//  defaultdesc: `false`
+	//  shortdesc: Whether to run LXCFS on a per-instance basis
+	"instances.lxcfs.per_instance": {Type: config.Bool, Validator: validate.Optional(validate.IsBool)},
+
 	// gendoc:generate(entity=server, group=miscellaneous, key=instances.nic.host_name)
 	// Possible values are `random` and `mac`.
 	//
@@ -669,6 +691,14 @@ var ConfigSchema = config.Schema{
 	//  shortdesc: OpenID Connect Discovery URL for the provider
 	"oidc.issuer": {},
 
+	// gendoc:generate(entity=server, group=oidc, key=oidc.scopes)
+	//
+	// ---
+	//  type: string
+	//  scope: global
+	//  shortdesc: Comma separated list of OpenID Connect scopes
+	"oidc.scopes": {Default: "openid, offline_access"},
+
 	// gendoc:generate(entity=server, group=oidc, key=oidc.audience)
 	// This value is required by some providers.
 	// ---
@@ -701,9 +731,9 @@ var ConfigSchema = config.Schema{
 	// ---
 	//  type: string
 	//  scope: global
-	//  defaultdesc: `unix:/var/run/ovn/ovnnb_db.sock`
+	//  defaultdesc: `unix:/run/ovn/ovnnb_db.sock`
 	//  shortdesc: OVN northbound database connection string
-	"network.ovn.northbound_connection": {Default: "unix:/var/run/ovn/ovnnb_db.sock"},
+	"network.ovn.northbound_connection": {Default: "unix:/run/ovn/ovnnb_db.sock"},
 
 	// gendoc:generate(entity=server, group=miscellaneous, key=network.ovn.ca_cert)
 	//

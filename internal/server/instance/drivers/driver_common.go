@@ -42,6 +42,10 @@ import (
 	"github.com/lxc/incus/v6/shared/util"
 )
 
+// Track last autorestart of an instance.
+var instancesLastRestart = map[int][10]time.Time{}
+var muInstancesLastRestart sync.Mutex
+
 // ErrExecCommandNotFound indicates the command is not found.
 var ErrExecCommandNotFound = api.StatusErrorf(http.StatusBadRequest, "Command not found")
 
@@ -143,6 +147,52 @@ func (d *common) ExpiryDate() time.Time {
 
 	// Return zero time if the instance is not a snapshot.
 	return time.Time{}
+}
+
+func (d *common) shouldAutoRestart() bool {
+	if !util.IsTrue(d.expandedConfig["boot.autorestart"]) {
+		return false
+	}
+
+	muInstancesLastRestart.Lock()
+	defer muInstancesLastRestart.Unlock()
+
+	// Check if the instance was ever auto-restarted.
+	timestamps, ok := instancesLastRestart[d.id]
+	if !ok || len(timestamps) == 0 {
+		// If not, record it and allow the auto-restart.
+		instancesLastRestart[d.id] = [10]time.Time{time.Now()}
+		return true
+	}
+
+	// If it has been auto-restarted, look for the oldest non-zero timestamp.
+	oldestIndex := 0
+	validTimestamps := 0
+	for i, timestamp := range timestamps {
+		if timestamp.IsZero() {
+			// We found an unused slot, lets use it.
+			timestamps[i] = time.Now()
+			instancesLastRestart[d.id] = timestamps
+			return true
+		}
+
+		validTimestamps++
+
+		if timestamp.Before(timestamps[oldestIndex]) {
+			oldestIndex = i
+		}
+	}
+
+	// Check if the oldest restart was more than a minute ago.
+	if timestamps[oldestIndex].Before(time.Now().Add(-1 * time.Minute)) {
+		// Remove the old timestamp and replace it with ours.
+		timestamps[oldestIndex] = time.Now()
+		instancesLastRestart[d.id] = timestamps
+		return true
+	}
+
+	// If not and all slots are used
+	return false
 }
 
 // ID gets instances's ID.
@@ -307,6 +357,8 @@ func (d *common) Snapshots() ([]instance.Instance, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		snapInst.SetOperation(d.op)
 
 		snapshots = append(snapshots, instance.Instance(snapInst))
 	}
@@ -533,7 +585,7 @@ func (d *common) expandConfig() error {
 // restartCommon handles the common part of instance restarts.
 func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) error {
 	// Setup a new operation for the stop/shutdown phase.
-	op, err := operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestart, true, true)
+	op, err := operationlock.Create(d.Project().Name, d.Name(), d.op, operationlock.ActionRestart, true, true)
 	if err != nil {
 		return fmt.Errorf("Create restart operation: %w", err)
 	}
@@ -597,7 +649,7 @@ func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) er
 	}
 
 	// Setup a new operation for the start phase.
-	op, err = operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestart, true, true)
+	op, err = operationlock.Create(d.Project().Name, d.Name(), d.op, operationlock.ActionRestart, true, true)
 	if err != nil {
 		return fmt.Errorf("Create restart (for start) operation: %w", err)
 	}
@@ -719,7 +771,7 @@ func (d *common) snapshotCommon(inst instance.Instance, name string, expiry time
 	}
 
 	// Create the snapshot.
-	snap, snapInstOp, cleanup, err := instance.CreateInternal(d.state, args, true, true)
+	snap, snapInstOp, cleanup, err := instance.CreateInternal(d.state, args, d.op, true, true)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance snapshot record %q: %w", name, err)
 	}
@@ -888,7 +940,7 @@ func (d *common) onStopOperationSetup(target string) (*operationlock.InstanceOpe
 	// If there is another ongoing operation that isn't in our inheritable list, wait until that has finished
 	// before proceeding to run the hook.
 	op := operationlock.Get(d.Project().Name, d.Name())
-	if op != nil && !op.ActionMatch(operationlock.ActionStart, operationlock.ActionRestart, operationlock.ActionStop, operationlock.ActionRestore) {
+	if op != nil && !op.ActionMatch(operationlock.ActionStart, operationlock.ActionRestart, operationlock.ActionStop, operationlock.ActionRestore, operationlock.ActionMigrate) {
 		d.logger.Debug("Waiting for existing operation lock to finish before running hook", logger.Ctx{"action": op.Action()})
 		_ = op.Wait(context.Background())
 		op = nil
@@ -902,7 +954,7 @@ func (d *common) onStopOperationSetup(target string) (*operationlock.InstanceOpe
 			action = operationlock.ActionRestart
 		}
 
-		op, err = operationlock.Create(d.Project().Name, d.Name(), action, false, false)
+		op, err = operationlock.Create(d.Project().Name, d.Name(), d.op, action, false, false)
 		if err != nil {
 			return nil, fmt.Errorf("Failed creating %q operation: %w", action, err)
 		}
@@ -1231,19 +1283,12 @@ func (d *common) devicesAdd(inst instance.Instance, instanceRunning bool) (rever
 // devicesRegister calls the Register() function on all of the instance's devices.
 func (d *common) devicesRegister(inst instance.Instance) {
 	for _, entry := range d.ExpandedDevices().Sorted() {
-		dev, err := d.deviceLoad(inst, entry.Name, entry.Config)
+		err := device.Register(inst, d.state, entry.Name, entry.Config)
 		if err != nil {
 			if errors.Is(err, device.ErrUnsupportedDevType) {
 				continue // Skip unsupported device (allows for mixed instance type profiles).
 			}
 
-			d.logger.Error("Failed register validation for device", logger.Ctx{"err": err, "device": entry.Name})
-			continue
-		}
-
-		// Check whether device wants to register for any events.
-		err = dev.Register()
-		if err != nil {
 			d.logger.Error("Failed to register device", logger.Ctx{"err": err, "device": entry.Name})
 			continue
 		}
